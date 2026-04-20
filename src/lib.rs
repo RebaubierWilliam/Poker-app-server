@@ -62,7 +62,7 @@ pub fn build_router(state: AppState) -> Router {
     let authed = Router::new()
         .merge(malettes::router())
         .merge(structures::router())
-        .route_layer(axum::middleware::from_fn_with_state(
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::api_key_middleware,
         ));
