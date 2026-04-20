@@ -164,3 +164,46 @@ async fn delete_malette_missing_returns_404() {
     let res = with_api_key(app, "DELETE", "/malettes/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn post_structures_creates_and_returns_result() {
+    let (app, _pool) = common::test_app().await;
+
+    let malette_body = json!({
+        "name": "M",
+        "chips": [
+            {"value": 25, "count": 100},
+            {"value": 100, "count": 100}
+        ]
+    });
+    let created = with_api_key(app.clone(), "POST", "/malettes", Some(malette_body)).await;
+    let malette_id = read_json(created).await["id"].as_i64().unwrap();
+
+    let body = json!({
+        "malette_id": malette_id,
+        "players": 9,
+        "total_duration_minutes": 240
+    });
+    let res = with_api_key(app, "POST", "/structures", Some(body)).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().contains_key("location"));
+    let got: serde_json::Value = read_json(res).await;
+    assert!(got["id"].is_number());
+    assert_eq!(got["malette_id"], malette_id);
+    assert_eq!(got["players"], 9);
+    assert_eq!(got["total_duration_minutes"], 240);
+    assert!(got["result"]["levels"].is_array());
+    assert!(got["result"]["starting_stack"].is_number());
+}
+
+#[tokio::test]
+async fn post_structures_with_unknown_malette_returns_422() {
+    let (app, _pool) = common::test_app().await;
+    let body = json!({
+        "malette_id": 9999,
+        "players": 9,
+        "total_duration_minutes": 240
+    });
+    let res = with_api_key(app, "POST", "/structures", Some(body)).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
