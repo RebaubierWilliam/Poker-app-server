@@ -1,0 +1,34 @@
+# Rust
+server/target/
+server/Cargo.lock
+
+# Flutter / Dart
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/.packages
+client/build/
+client/ios/Pods/
+client/ios/.symlinks/
+client/ios/Flutter/Flutter.framework/
+client/ios/Flutter/Flutter.podspec
+client/android/.gradle/
+client/android/app/debug/
+client/android/app/profile/
+client/android/app/release/
+client/android/captures/
+client/android/gradlew
+client/android/gradlew.bat
+client/android/gradle/
+client/android/local.properties
+client/**/GeneratedPluginRegistrant.*
+client/.idea/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
