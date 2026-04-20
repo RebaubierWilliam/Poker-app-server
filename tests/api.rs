@@ -46,3 +46,24 @@ async fn health_is_public_and_returns_ok() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn post_malettes_creates_and_returns_the_row() {
+    let (app, _pool) = common::test_app().await;
+    let body = json!({
+        "name": "Starter 300",
+        "chips": [
+            {"value": 25, "count": 100},
+            {"value": 100, "count": 80}
+        ]
+    });
+    let res = with_api_key(app, "POST", "/malettes", Some(body.clone())).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().contains_key("location"));
+    let got: serde_json::Value = read_json(res).await;
+    assert!(got["id"].is_number());
+    assert_eq!(got["name"], "Starter 300");
+    assert_eq!(got["chips"], body["chips"]);
+    assert!(got["created_at"].is_string());
+    assert!(got["updated_at"].is_string());
+}

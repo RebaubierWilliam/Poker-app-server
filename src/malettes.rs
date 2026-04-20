@@ -1,7 +1,104 @@
-use axum::Router;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
+use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/malettes", post(create))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MaletteInput {
+    pub name: String,
+    pub chips: Vec<ChipInput>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChipInput {
+    pub value: u32,
+    pub count: u32,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct MaletteRow {
+    pub id: i64,
+    pub name: String,
+    pub chips: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MaletteOut {
+    pub id: i64,
+    pub name: String,
+    pub chips: JsonValue,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl TryFrom<MaletteRow> for MaletteOut {
+    type Error = AppError;
+    fn try_from(r: MaletteRow) -> Result<Self, Self::Error> {
+        let chips: JsonValue = serde_json::from_str(&r.chips)
+            .map_err(|e| AppError::Validation(format!("stored chips JSON invalid: {e}")))?;
+        Ok(MaletteOut {
+            id: r.id,
+            name: r.name,
+            chips,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+    }
+}
+
+fn validate_input(input: &MaletteInput) -> AppResult<()> {
+    if input.name.trim().is_empty() {
+        return Err(AppError::Validation("name must not be empty".into()));
+    }
+    if input.chips.is_empty() {
+        return Err(AppError::Validation("chips must not be empty".into()));
+    }
+    for c in &input.chips {
+        if c.value == 0 {
+            return Err(AppError::Validation("chip value must be > 0".into()));
+        }
+        if c.count == 0 {
+            return Err(AppError::Validation("chip count must be > 0".into()));
+        }
+    }
+    Ok(())
+}
+
+async fn create(
+    State(state): State<AppState>,
+    Json(input): Json<MaletteInput>,
+) -> AppResult<Response> {
+    validate_input(&input)?;
+    let chips_json = serde_json::to_string(&input.chips)
+        .map_err(|e| AppError::Validation(format!("chips serialization: {e}")))?;
+
+    let row: MaletteRow = sqlx::query_as(
+        r#"
+        INSERT INTO malettes (name, chips)
+        VALUES (?1, ?2)
+        RETURNING id, name, chips, created_at, updated_at
+        "#,
+    )
+    .bind(&input.name)
+    .bind(&chips_json)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let out = MaletteOut::try_from(row)?;
+    let location = format!("/malettes/{}", out.id);
+    Ok((StatusCode::CREATED, [("location", location)], Json(out)).into_response())
 }
