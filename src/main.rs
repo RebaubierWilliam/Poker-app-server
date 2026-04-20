@@ -1,8 +1,6 @@
-mod blind_timer;
+use std::net::SocketAddr;
 
-use axum::{extract::Json, http::StatusCode, routing::{get, post}, Router};
-use blind_timer::{compute_structure, TournamentInput, TournamentStructure};
-use tower_http::cors::CorsLayer;
+use poker_blind_timer_server::{build_pool, build_router, make_state, read_config, run_migrations};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,34 +11,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/structure", post(structure_handler))
-        .layer(CorsLayer::permissive());
+    let cfg = read_config()?;
+    let pool = build_pool(&cfg.database_url).await?;
+    run_migrations(&pool).await?;
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let state = make_state(pool, cfg.api_key);
+    let router = build_router(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!("listening on {}", addr);
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, router).await?;
     Ok(())
-}
-
-async fn structure_handler(
-    Json(input): Json<TournamentInput>,
-) -> Result<Json<TournamentStructure>, (StatusCode, String)> {
-    if input.players < 2 {
-        return Err((StatusCode::BAD_REQUEST, "au moins 2 joueurs".into()));
-    }
-    if input.total_duration_minutes == 0 {
-        return Err((StatusCode::BAD_REQUEST, "durée invalide".into()));
-    }
-    if input.case_chips.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "malette vide".into()));
-    }
-    Ok(Json(compute_structure(&input)))
 }
