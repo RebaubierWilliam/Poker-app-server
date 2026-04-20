@@ -36,8 +36,11 @@ async fn structure_handler(
     if input.players < 2 {
         return Err((StatusCode::BAD_REQUEST, "au moins 2 joueurs".into()));
     }
-    if input.level_duration_minutes == 0 || input.target_duration_minutes == 0 {
+    if input.total_duration_minutes == 0 {
         return Err((StatusCode::BAD_REQUEST, "durée invalide".into()));
+    }
+    if input.case_chips.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "malette vide".into()));
     }
     Ok(Json(compute_structure(&input)))
 }

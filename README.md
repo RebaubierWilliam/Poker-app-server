@@ -1,46 +1,35 @@
-# poker-blind-timer
+# poker-blind-timer (serveur)
 
-Générateur de structure de blinds pour soirées poker, avec timer mobile.
+API Rust qui génère une structure de blinds pour une soirée poker à partir de la composition de la malette et du nombre de joueurs.
 
-Projet d'apprentissage : **Rust** (serveur) et **Flutter** (client mobile).
+Projet d'apprentissage **Rust** (Axum + Tokio).
+
+Le client mobile vit dans un autre repo.
 
 ## Objectif
 
 À partir de :
 - nombre de joueurs
 - durée totale souhaitée du tournoi
-- durée de chaque niveau
-- dotation en jetons par joueur
+- contenu total de la malette (quantité de jetons par valeur faciale)
 
-...l'application propose une structure de blinds adaptée (progression géométrique, pause au milieu, antes en deuxième moitié), et fournit un timer mobile pour animer la soirée.
+...l'API calcule :
+- la répartition des jetons par joueur (stack de départ)
+- une durée de niveau adaptée
+- une progression de blinds (géométrique, pause au milieu, antes en deuxième moitié)
 
 ## Stack
 
-| Couche      | Techno                                |
-|-------------|---------------------------------------|
-| Serveur     | Rust + Axum + Tokio                   |
-| Client      | Flutter (Android + iOS)               |
-| Déploiement | Fly.io (serveur), stores mobiles plus tard |
-
-## Structure du repo
-
-```
-poker-blind-timer/
-├── server/     # Rust, Axum API
-│   └── src/
-│       ├── main.rs          # point d'entrée HTTP
-│       └── blind_timer.rs   # algorithme de structure
-└── client/     # Flutter, app mobile
-    └── lib/
-        └── main.dart
-```
+| Couche      | Techno               |
+|-------------|----------------------|
+| Serveur     | Rust + Axum + Tokio  |
+| Déploiement | Fly.io (prévu)       |
 
 ## Lancer le serveur en local
 
 ```bash
-cd server
 cargo run
-# puis POST http://localhost:8080/structure avec un JSON (voir plus bas)
+# puis POST http://localhost:8080/structure
 ```
 
 Test rapide :
@@ -50,60 +39,44 @@ curl -X POST http://localhost:8080/structure \
   -H "Content-Type: application/json" \
   -d '{
     "players": 9,
-    "target_duration_minutes": 240,
-    "level_duration_minutes": 20,
-    "chips_per_player": [
-      {"value": 25,   "count": 8},
-      {"value": 100,  "count": 10},
-      {"value": 500,  "count": 4},
-      {"value": 1000, "count": 2}
+    "total_duration_minutes": 240,
+    "case_chips": [
+      {"value": 25,   "count": 100},
+      {"value": 100,  "count": 100},
+      {"value": 500,  "count": 50},
+      {"value": 1000, "count": 25}
     ]
   }'
 ```
 
-Tests unitaires de l'algorithme :
+Tests unitaires :
 
 ```bash
-cd server
 cargo test
-```
-
-## Lancer le client Flutter
-
-```bash
-cd client
-flutter pub get
-flutter run
 ```
 
 ## Roadmap
 
-### Phase 1 — MVP (en cours)
-- [x] Scaffold serveur Rust + client Flutter
+### Phase 1 — MVP
 - [x] Algorithme v1 de structure de blinds (progression géométrique)
 - [x] Endpoint `POST /structure`
-- [ ] Écran Flutter : formulaire de paramètres → affichage de la structure
-- [ ] Écran Flutter : timer avec niveau courant, temps restant, blinds
+- [x] Répartition automatique de la malette par joueur
 
-### Phase 2 — Soirée réelle
-- [ ] Sauvegarde locale des presets (Hive ou SharedPreferences)
-- [ ] Notifications sonores à chaque changement de niveau
-- [ ] Mode plein écran pour afficher le timer sur grand écran
-
-### Phase 3 — Déploiement
-- [ ] Dockerfile du serveur
+### Phase 2 — Déploiement
+- [ ] Dockerfile
 - [ ] `fly launch` sur Fly.io
-- [ ] CI GitHub Actions (cargo test + flutter test)
+- [ ] CI GitHub Actions (`cargo test`)
 
-## Algorithme de structure
+## Algorithme
 
 Principe :
-1. **Stack initial** par joueur = somme de (valeur × quantité) pour chaque dénomination
-2. **BB de départ** ≈ stack_initial / 100 (profondeur confortable de 100 BB)
-3. **BB finale** ≈ total_chips / 20 (phase push/fold en fin de tournoi)
-4. **Progression géométrique** : chaque niveau multiplie la BB par un ratio constant
-5. **Arrondi** sur le plus petit jeton disponible pour des valeurs "propres"
-6. **Antes** introduites au tiers du tournoi (~10% de la BB)
-7. **Pause** de 10 min au milieu
+1. **Répartition** : chaque valeur de la malette est divisée par le nombre de joueurs (division entière)
+2. **Stack de départ** = somme des (valeur × quantité par joueur)
+3. **BB initiale** ≈ stack / 100 (profondeur 100 BB)
+4. **BB finale** ≈ total_chips / 20 (push/fold)
+5. **Progression géométrique** entre ces deux bornes
+6. **Arrondi** sur le plus petit jeton disponible
+7. **Antes** introduites au tiers du tournoi (~10% de la BB)
+8. **Pause** de 10 min au milieu
 
-Voir [`server/src/blind_timer.rs`](server/src/blind_timer.rs).
+Voir [`src/blind_timer.rs`](src/blind_timer.rs).
