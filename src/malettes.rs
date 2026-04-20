@@ -12,7 +12,9 @@ use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/malettes", post(create))
+    Router::new()
+        .route("/malettes", post(create))
+        .route("/malettes/:id", get(get_one))
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,4 +103,18 @@ async fn create(
     let out = MaletteOut::try_from(row)?;
     let location = format!("/malettes/{}", out.id);
     Ok((StatusCode::CREATED, [("location", location)], Json(out)).into_response())
+}
+
+async fn get_one(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<MaletteOut>> {
+    let row: Option<MaletteRow> = sqlx::query_as(
+        "SELECT id, name, chips, created_at, updated_at FROM malettes WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let row = row.ok_or(AppError::NotFound)?;
+    Ok(Json(MaletteOut::try_from(row)?))
 }

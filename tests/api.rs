@@ -67,3 +67,30 @@ async fn post_malettes_creates_and_returns_the_row() {
     assert!(got["created_at"].is_string());
     assert!(got["updated_at"].is_string());
 }
+
+#[tokio::test]
+async fn get_malette_by_id_returns_stored_row() {
+    let (app, _pool) = common::test_app().await;
+
+    let body = json!({
+        "name": "M1",
+        "chips": [{"value": 25, "count": 100}]
+    });
+    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: serde_json::Value = read_json(created).await;
+    let id = created["id"].as_i64().unwrap();
+
+    let res = with_api_key(app, "GET", &format!("/malettes/{id}"), None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let got: serde_json::Value = read_json(res).await;
+    assert_eq!(got["id"], id);
+    assert_eq!(got["name"], "M1");
+}
+
+#[tokio::test]
+async fn get_malette_missing_returns_404() {
+    let (app, _pool) = common::test_app().await;
+    let res = with_api_key(app, "GET", "/malettes/9999", None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
