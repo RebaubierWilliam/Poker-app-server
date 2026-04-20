@@ -14,7 +14,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/malettes", get(list).post(create))
-        .route("/malettes/:id", get(get_one).put(update))
+        .route("/malettes/:id", get(get_one).put(update).delete(delete_one))
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,4 +155,18 @@ async fn update(
 
     let row = row.ok_or(AppError::NotFound)?;
     Ok(Json(MaletteOut::try_from(row)?))
+}
+
+async fn delete_one(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<StatusCode> {
+    let res = sqlx::query("DELETE FROM malettes WHERE id = ?1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

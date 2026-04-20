@@ -142,3 +142,25 @@ async fn put_malette_missing_returns_404() {
     let res = with_api_key(app, "PUT", "/malettes/9999", Some(body)).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn delete_malette_returns_204_then_404_on_get() {
+    let (app, _pool) = common::test_app().await;
+
+    let body = json!({"name": "x", "chips": [{"value": 25, "count": 10}]});
+    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    let id = read_json(created).await["id"].as_i64().unwrap();
+
+    let res = with_api_key(app.clone(), "DELETE", &format!("/malettes/{id}"), None).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let res = with_api_key(app, "GET", &format!("/malettes/{id}"), None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_malette_missing_returns_404() {
+    let (app, _pool) = common::test_app().await;
+    let res = with_api_key(app, "DELETE", "/malettes/9999", None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
