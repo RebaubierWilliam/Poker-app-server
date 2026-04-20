@@ -14,7 +14,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/malettes", get(list).post(create))
-        .route("/malettes/:id", get(get_one))
+        .route("/malettes/:id", get(get_one).put(update))
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,4 +128,31 @@ async fn list(State(state): State<AppState>) -> AppResult<Json<Vec<MaletteOut>>>
     let out: Result<Vec<MaletteOut>, AppError> =
         rows.into_iter().map(MaletteOut::try_from).collect();
     Ok(Json(out?))
+}
+
+async fn update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<MaletteInput>,
+) -> AppResult<Json<MaletteOut>> {
+    validate_input(&input)?;
+    let chips_json = serde_json::to_string(&input.chips)
+        .map_err(|e| AppError::Validation(format!("chips serialization: {e}")))?;
+
+    let row: Option<MaletteRow> = sqlx::query_as(
+        r#"
+        UPDATE malettes
+        SET name = ?1, chips = ?2, updated_at = datetime('now')
+        WHERE id = ?3
+        RETURNING id, name, chips, created_at, updated_at
+        "#,
+    )
+    .bind(&input.name)
+    .bind(&chips_json)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let row = row.ok_or(AppError::NotFound)?;
+    Ok(Json(MaletteOut::try_from(row)?))
 }

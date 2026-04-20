@@ -113,3 +113,32 @@ async fn list_malettes_returns_all_rows_ordered_by_id() {
     assert_eq!(arr[0]["name"], "A");
     assert_eq!(arr[2]["name"], "C");
 }
+
+#[tokio::test]
+async fn put_malette_updates_row_and_bumps_updated_at() {
+    let (app, _pool) = common::test_app().await;
+
+    let body = json!({"name": "old", "chips": [{"value": 25, "count": 10}]});
+    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    let created: serde_json::Value = read_json(created).await;
+    let id = created["id"].as_i64().unwrap();
+    let old_updated = created["updated_at"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let new_body = json!({"name": "new", "chips": [{"value": 100, "count": 50}]});
+    let res = with_api_key(app.clone(), "PUT", &format!("/malettes/{id}"), Some(new_body)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let got: serde_json::Value = read_json(res).await;
+    assert_eq!(got["name"], "new");
+    assert_eq!(got["chips"][0]["value"], 100);
+    assert_ne!(got["updated_at"].as_str().unwrap(), old_updated);
+}
+
+#[tokio::test]
+async fn put_malette_missing_returns_404() {
+    let (app, _pool) = common::test_app().await;
+    let body = json!({"name": "x", "chips": [{"value": 25, "count": 10}]});
+    let res = with_api_key(app, "PUT", "/malettes/9999", Some(body)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
