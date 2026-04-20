@@ -13,7 +13,7 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/malettes", post(create))
+        .route("/malettes", get(list).post(create))
         .route("/malettes/:id", get(get_one))
 }
 
@@ -117,4 +117,15 @@ async fn get_one(
     .await?;
     let row = row.ok_or(AppError::NotFound)?;
     Ok(Json(MaletteOut::try_from(row)?))
+}
+
+async fn list(State(state): State<AppState>) -> AppResult<Json<Vec<MaletteOut>>> {
+    let rows: Vec<MaletteRow> = sqlx::query_as(
+        "SELECT id, name, chips, created_at, updated_at FROM malettes ORDER BY id ASC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let out: Result<Vec<MaletteOut>, AppError> =
+        rows.into_iter().map(MaletteOut::try_from).collect();
+    Ok(Json(out?))
 }

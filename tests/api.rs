@@ -94,3 +94,22 @@ async fn get_malette_missing_returns_404() {
     let res = with_api_key(app, "GET", "/malettes/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn list_malettes_returns_all_rows_ordered_by_id() {
+    let (app, _pool) = common::test_app().await;
+
+    for name in ["A", "B", "C"] {
+        let body = json!({"name": name, "chips": [{"value": 25, "count": 10}]});
+        let r = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
+    let res = with_api_key(app, "GET", "/malettes", None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let list: serde_json::Value = read_json(res).await;
+    let arr = list.as_array().expect("array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["name"], "A");
+    assert_eq!(arr[2]["name"], "C");
+}
