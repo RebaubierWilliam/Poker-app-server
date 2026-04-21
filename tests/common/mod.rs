@@ -5,8 +5,6 @@ use sqlx::ConnectOptions;
 use sqlx::SqlitePool;
 use std::str::FromStr;
 
-pub const TEST_API_KEY: &str = "test-secret-key";
-
 pub async fn test_pool() -> SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
@@ -26,7 +24,7 @@ pub async fn test_pool() -> SqlitePool {
 
 pub async fn test_app() -> (Router, SqlitePool) {
     let pool = test_pool().await;
-    let state = make_state(pool.clone(), TEST_API_KEY);
+    let state = make_state(pool.clone());
     let router = build_router(state);
     (router, pool)
 }

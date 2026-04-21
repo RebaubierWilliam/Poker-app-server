@@ -5,16 +5,13 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-pub async fn with_api_key(
+pub async fn send_request(
     app: axum::Router,
     method: &str,
     uri: &str,
     body: Option<serde_json::Value>,
 ) -> axum::http::Response<Body> {
-    let mut req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("x-api-key", common::TEST_API_KEY);
+    let mut req = Request::builder().method(method).uri(uri);
     if body.is_some() {
         req = req.header("content-type", "application/json");
     }
@@ -57,7 +54,7 @@ async fn post_malettes_creates_and_returns_the_row() {
             {"value": 100, "count": 80}
         ]
     });
-    let res = with_api_key(app, "POST", "/malettes", Some(body.clone())).await;
+    let res = send_request(app, "POST", "/malettes", Some(body.clone())).await;
     assert_eq!(res.status(), StatusCode::CREATED);
     assert!(res.headers().contains_key("location"));
     let got: serde_json::Value = read_json(res).await;
@@ -76,12 +73,12 @@ async fn get_malette_by_id_returns_stored_row() {
         "name": "M1",
         "chips": [{"value": 25, "count": 100}]
     });
-    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    let created = send_request(app.clone(), "POST", "/malettes", Some(body)).await;
     assert_eq!(created.status(), StatusCode::CREATED);
     let created: serde_json::Value = read_json(created).await;
     let id = created["id"].as_i64().unwrap();
 
-    let res = with_api_key(app, "GET", &format!("/malettes/{id}"), None).await;
+    let res = send_request(app, "GET", &format!("/malettes/{id}"), None).await;
     assert_eq!(res.status(), StatusCode::OK);
     let got: serde_json::Value = read_json(res).await;
     assert_eq!(got["id"], id);
@@ -91,7 +88,7 @@ async fn get_malette_by_id_returns_stored_row() {
 #[tokio::test]
 async fn get_malette_missing_returns_404() {
     let (app, _pool) = common::test_app().await;
-    let res = with_api_key(app, "GET", "/malettes/9999", None).await;
+    let res = send_request(app, "GET", "/malettes/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
@@ -101,11 +98,11 @@ async fn list_malettes_returns_all_rows_ordered_by_id() {
 
     for name in ["A", "B", "C"] {
         let body = json!({"name": name, "chips": [{"value": 25, "count": 10}]});
-        let r = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+        let r = send_request(app.clone(), "POST", "/malettes", Some(body)).await;
         assert_eq!(r.status(), StatusCode::CREATED);
     }
 
-    let res = with_api_key(app, "GET", "/malettes", None).await;
+    let res = send_request(app, "GET", "/malettes", None).await;
     assert_eq!(res.status(), StatusCode::OK);
     let list: serde_json::Value = read_json(res).await;
     let arr = list.as_array().expect("array");
@@ -119,7 +116,7 @@ async fn put_malette_updates_row_and_bumps_updated_at() {
     let (app, _pool) = common::test_app().await;
 
     let body = json!({"name": "old", "chips": [{"value": 25, "count": 10}]});
-    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    let created = send_request(app.clone(), "POST", "/malettes", Some(body)).await;
     let created: serde_json::Value = read_json(created).await;
     let id = created["id"].as_i64().unwrap();
     let old_updated = created["updated_at"].as_str().unwrap().to_string();
@@ -127,7 +124,7 @@ async fn put_malette_updates_row_and_bumps_updated_at() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     let new_body = json!({"name": "new", "chips": [{"value": 100, "count": 50}]});
-    let res = with_api_key(app.clone(), "PUT", &format!("/malettes/{id}"), Some(new_body)).await;
+    let res = send_request(app.clone(), "PUT", &format!("/malettes/{id}"), Some(new_body)).await;
     assert_eq!(res.status(), StatusCode::OK);
     let got: serde_json::Value = read_json(res).await;
     assert_eq!(got["name"], "new");
@@ -139,7 +136,7 @@ async fn put_malette_updates_row_and_bumps_updated_at() {
 async fn put_malette_missing_returns_404() {
     let (app, _pool) = common::test_app().await;
     let body = json!({"name": "x", "chips": [{"value": 25, "count": 10}]});
-    let res = with_api_key(app, "PUT", "/malettes/9999", Some(body)).await;
+    let res = send_request(app, "PUT", "/malettes/9999", Some(body)).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
@@ -148,20 +145,20 @@ async fn delete_malette_returns_204_then_404_on_get() {
     let (app, _pool) = common::test_app().await;
 
     let body = json!({"name": "x", "chips": [{"value": 25, "count": 10}]});
-    let created = with_api_key(app.clone(), "POST", "/malettes", Some(body)).await;
+    let created = send_request(app.clone(), "POST", "/malettes", Some(body)).await;
     let id = read_json(created).await["id"].as_i64().unwrap();
 
-    let res = with_api_key(app.clone(), "DELETE", &format!("/malettes/{id}"), None).await;
+    let res = send_request(app.clone(), "DELETE", &format!("/malettes/{id}"), None).await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
-    let res = with_api_key(app, "GET", &format!("/malettes/{id}"), None).await;
+    let res = send_request(app, "GET", &format!("/malettes/{id}"), None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn delete_malette_missing_returns_404() {
     let (app, _pool) = common::test_app().await;
-    let res = with_api_key(app, "DELETE", "/malettes/9999", None).await;
+    let res = send_request(app, "DELETE", "/malettes/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
@@ -176,7 +173,7 @@ async fn post_structures_creates_and_returns_result() {
             {"value": 100, "count": 100}
         ]
     });
-    let created = with_api_key(app.clone(), "POST", "/malettes", Some(malette_body)).await;
+    let created = send_request(app.clone(), "POST", "/malettes", Some(malette_body)).await;
     let malette_id = read_json(created).await["id"].as_i64().unwrap();
 
     let body = json!({
@@ -184,7 +181,7 @@ async fn post_structures_creates_and_returns_result() {
         "players": 9,
         "total_duration_minutes": 240
     });
-    let res = with_api_key(app, "POST", "/structures", Some(body)).await;
+    let res = send_request(app, "POST", "/structures", Some(body)).await;
     assert_eq!(res.status(), StatusCode::CREATED);
     assert!(res.headers().contains_key("location"));
     let got: serde_json::Value = read_json(res).await;
@@ -204,7 +201,7 @@ async fn post_structures_with_unknown_malette_returns_422() {
         "players": 9,
         "total_duration_minutes": 240
     });
-    let res = with_api_key(app, "POST", "/structures", Some(body)).await;
+    let res = send_request(app, "POST", "/structures", Some(body)).await;
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
@@ -213,14 +210,14 @@ async fn get_structure_by_id_returns_stored_result() {
     let (app, _pool) = common::test_app().await;
 
     let malette_body = json!({"name": "M", "chips": [{"value": 25, "count": 100}]});
-    let created = with_api_key(app.clone(), "POST", "/malettes", Some(malette_body)).await;
+    let created = send_request(app.clone(), "POST", "/malettes", Some(malette_body)).await;
     let mid = read_json(created).await["id"].as_i64().unwrap();
 
     let s_body = json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120});
-    let s = with_api_key(app.clone(), "POST", "/structures", Some(s_body)).await;
+    let s = send_request(app.clone(), "POST", "/structures", Some(s_body)).await;
     let sid = read_json(s).await["id"].as_i64().unwrap();
 
-    let res = with_api_key(app, "GET", &format!("/structures/{sid}"), None).await;
+    let res = send_request(app, "GET", &format!("/structures/{sid}"), None).await;
     assert_eq!(res.status(), StatusCode::OK);
     let got: serde_json::Value = read_json(res).await;
     assert_eq!(got["id"], sid);
@@ -231,7 +228,7 @@ async fn get_structure_by_id_returns_stored_result() {
 #[tokio::test]
 async fn get_structure_missing_returns_404() {
     let (app, _pool) = common::test_app().await;
-    let res = with_api_key(app, "GET", "/structures/9999", None).await;
+    let res = send_request(app, "GET", "/structures/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
@@ -239,7 +236,7 @@ async fn get_structure_missing_returns_404() {
 async fn list_structures_filters_by_malette_id() {
     let (app, _pool) = common::test_app().await;
 
-    let m1 = with_api_key(
+    let m1 = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -247,7 +244,7 @@ async fn list_structures_filters_by_malette_id() {
     )
     .await;
     let m1_id = read_json(m1).await["id"].as_i64().unwrap();
-    let m2 = with_api_key(
+    let m2 = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -258,14 +255,14 @@ async fn list_structures_filters_by_malette_id() {
 
     for mid in [m1_id, m1_id, m2_id] {
         let body = json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120});
-        with_api_key(app.clone(), "POST", "/structures", Some(body)).await;
+        send_request(app.clone(), "POST", "/structures", Some(body)).await;
     }
 
-    let all = with_api_key(app.clone(), "GET", "/structures", None).await;
+    let all = send_request(app.clone(), "GET", "/structures", None).await;
     assert_eq!(all.status(), StatusCode::OK);
     assert_eq!(read_json(all).await.as_array().unwrap().len(), 3);
 
-    let filt = with_api_key(
+    let filt = send_request(
         app,
         "GET",
         &format!("/structures?malette_id={m1_id}"),
@@ -285,7 +282,7 @@ async fn list_structures_filters_by_malette_id() {
 async fn put_structure_regenerates_result_and_bumps_updated_at() {
     let (app, _pool) = common::test_app().await;
 
-    let m = with_api_key(
+    let m = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -294,7 +291,7 @@ async fn put_structure_regenerates_result_and_bumps_updated_at() {
     .await;
     let mid = read_json(m).await["id"].as_i64().unwrap();
 
-    let s = with_api_key(
+    let s = send_request(
         app.clone(),
         "POST",
         "/structures",
@@ -307,7 +304,7 @@ async fn put_structure_regenerates_result_and_bumps_updated_at() {
 
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-    let res = with_api_key(
+    let res = send_request(
         app,
         "PUT",
         &format!("/structures/{sid}"),
@@ -325,7 +322,7 @@ async fn put_structure_regenerates_result_and_bumps_updated_at() {
 #[tokio::test]
 async fn put_structure_missing_returns_404() {
     let (app, _pool) = common::test_app().await;
-    let m = with_api_key(
+    let m = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -334,7 +331,7 @@ async fn put_structure_missing_returns_404() {
     .await;
     let mid = read_json(m).await["id"].as_i64().unwrap();
 
-    let res = with_api_key(
+    let res = send_request(
         app,
         "PUT",
         "/structures/9999",
@@ -347,7 +344,7 @@ async fn put_structure_missing_returns_404() {
 #[tokio::test]
 async fn put_structure_with_unknown_malette_returns_422() {
     let (app, _pool) = common::test_app().await;
-    let m = with_api_key(
+    let m = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -355,7 +352,7 @@ async fn put_structure_with_unknown_malette_returns_422() {
     )
     .await;
     let mid = read_json(m).await["id"].as_i64().unwrap();
-    let s = with_api_key(
+    let s = send_request(
         app.clone(),
         "POST",
         "/structures",
@@ -364,7 +361,7 @@ async fn put_structure_with_unknown_malette_returns_422() {
     .await;
     let sid = read_json(s).await["id"].as_i64().unwrap();
 
-    let res = with_api_key(
+    let res = send_request(
         app,
         "PUT",
         &format!("/structures/{sid}"),
@@ -377,7 +374,7 @@ async fn put_structure_with_unknown_malette_returns_422() {
 #[tokio::test]
 async fn delete_structure_returns_204_then_404() {
     let (app, _pool) = common::test_app().await;
-    let m = with_api_key(
+    let m = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -385,7 +382,7 @@ async fn delete_structure_returns_204_then_404() {
     )
     .await;
     let mid = read_json(m).await["id"].as_i64().unwrap();
-    let s = with_api_key(
+    let s = send_request(
         app.clone(),
         "POST",
         "/structures",
@@ -394,10 +391,10 @@ async fn delete_structure_returns_204_then_404() {
     .await;
     let sid = read_json(s).await["id"].as_i64().unwrap();
 
-    let res = with_api_key(app.clone(), "DELETE", &format!("/structures/{sid}"), None).await;
+    let res = send_request(app.clone(), "DELETE", &format!("/structures/{sid}"), None).await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
-    let res = with_api_key(app, "GET", &format!("/structures/{sid}"), None).await;
+    let res = send_request(app, "GET", &format!("/structures/{sid}"), None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
@@ -405,7 +402,7 @@ async fn delete_structure_returns_204_then_404() {
 async fn deleting_malette_cascades_to_structures() {
     let (app, _pool) = common::test_app().await;
 
-    let m = with_api_key(
+    let m = send_request(
         app.clone(),
         "POST",
         "/malettes",
@@ -414,7 +411,7 @@ async fn deleting_malette_cascades_to_structures() {
     .await;
     let mid = read_json(m).await["id"].as_i64().unwrap();
     for _ in 0..3 {
-        with_api_key(
+        send_request(
             app.clone(),
             "POST",
             "/structures",
@@ -423,58 +420,12 @@ async fn deleting_malette_cascades_to_structures() {
         .await;
     }
 
-    let all = with_api_key(app.clone(), "GET", "/structures", None).await;
+    let all = send_request(app.clone(), "GET", "/structures", None).await;
     assert_eq!(read_json(all).await.as_array().unwrap().len(), 3);
 
-    let d = with_api_key(app.clone(), "DELETE", &format!("/malettes/{mid}"), None).await;
+    let d = send_request(app.clone(), "DELETE", &format!("/malettes/{mid}"), None).await;
     assert_eq!(d.status(), StatusCode::NO_CONTENT);
 
-    let after = with_api_key(app, "GET", "/structures", None).await;
+    let after = send_request(app, "GET", "/structures", None).await;
     assert_eq!(read_json(after).await.as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn missing_api_key_on_protected_route_returns_401() {
-    let (app, _pool) = common::test_app().await;
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/malettes")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn wrong_api_key_returns_401() {
-    let (app, _pool) = common::test_app().await;
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/malettes")
-                .header("x-api-key", "not-the-key")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn health_is_reachable_without_api_key() {
-    let (app, _pool) = common::test_app().await;
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
 }

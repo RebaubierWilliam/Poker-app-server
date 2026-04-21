@@ -10,7 +10,6 @@ pub enum AppError {
     NotFound,
     Validation(String),
     MaletteNotFound(i64),
-    Unauthorized,
     Db(sqlx::Error),
     Compute(anyhow::Error),
 }
@@ -44,10 +43,6 @@ impl IntoResponse for AppError {
                     "error": "malette_id references nonexistent malette",
                     "malette_id": id
                 }),
-            ),
-            AppError::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "invalid or missing API key"}),
             ),
             AppError::Db(e) => {
                 tracing::error!(error = ?e, "database error");

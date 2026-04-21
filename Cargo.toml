@@ -15,4 +15,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
-subtle = "2"

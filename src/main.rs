@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = build_pool(&cfg.database_url).await?;
     run_migrations(&pool).await?;
 
-    let state = make_state(pool, cfg.api_key);
+    let state = make_state(pool);
     let router = build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
