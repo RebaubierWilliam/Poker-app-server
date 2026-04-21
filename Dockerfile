@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /app/target/release/poker-blind-timer-server /usr/local/bin/poker-blind-timer-server
 
+RUN mkdir -p /data
+
 ENV PORT=8080
 EXPOSE 8080
 CMD ["/usr/local/bin/poker-blind-timer-server"]
