@@ -207,3 +207,30 @@ async fn post_structures_with_unknown_malette_returns_422() {
     let res = with_api_key(app, "POST", "/structures", Some(body)).await;
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn get_structure_by_id_returns_stored_result() {
+    let (app, _pool) = common::test_app().await;
+
+    let malette_body = json!({"name": "M", "chips": [{"value": 25, "count": 100}]});
+    let created = with_api_key(app.clone(), "POST", "/malettes", Some(malette_body)).await;
+    let mid = read_json(created).await["id"].as_i64().unwrap();
+
+    let s_body = json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120});
+    let s = with_api_key(app.clone(), "POST", "/structures", Some(s_body)).await;
+    let sid = read_json(s).await["id"].as_i64().unwrap();
+
+    let res = with_api_key(app, "GET", &format!("/structures/{sid}"), None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let got: serde_json::Value = read_json(res).await;
+    assert_eq!(got["id"], sid);
+    assert_eq!(got["malette_id"], mid);
+    assert_eq!(got["players"], 4);
+}
+
+#[tokio::test]
+async fn get_structure_missing_returns_404() {
+    let (app, _pool) = common::test_app().await;
+    let res = with_api_key(app, "GET", "/structures/9999", None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}

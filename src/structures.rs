@@ -162,10 +162,18 @@ async fn list(
 }
 
 async fn get_one(
-    State(_state): State<AppState>,
-    Path(_id): Path<i64>,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
 ) -> AppResult<Json<StructureOut>> {
-    Err(AppError::Validation("get_one not implemented".into()))
+    let row: Option<StructureRow> = sqlx::query_as(
+        "SELECT id, malette_id, players, total_duration_minutes, result, created_at, updated_at \
+         FROM structures WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let row = row.ok_or(AppError::NotFound)?;
+    Ok(Json(StructureOut::try_from(row)?))
 }
 
 async fn update(
