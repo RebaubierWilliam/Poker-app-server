@@ -195,11 +195,44 @@ async fn get_one(
 }
 
 async fn update(
-    State(_state): State<AppState>,
-    Path(_id): Path<i64>,
-    Json(_input): Json<StructureInput>,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<StructureInput>,
 ) -> AppResult<Json<StructureOut>> {
-    Err(AppError::Validation("update not implemented".into()))
+    validate_input(&input)?;
+
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM structures WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let chips = load_malette_chips(&state.pool, input.malette_id).await?;
+    let result_json = compute_and_serialize(&input, chips)?;
+
+    let row: StructureRow = sqlx::query_as(
+        r#"
+        UPDATE structures
+        SET malette_id = ?1,
+            players = ?2,
+            total_duration_minutes = ?3,
+            result = ?4,
+            updated_at = datetime('now')
+        WHERE id = ?5
+        RETURNING id, malette_id, players, total_duration_minutes, result, created_at, updated_at
+        "#,
+    )
+    .bind(input.malette_id)
+    .bind(input.players as i64)
+    .bind(input.total_duration_minutes as i64)
+    .bind(&result_json)
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(StructureOut::try_from(row)?))
 }
 
 async fn delete_one(

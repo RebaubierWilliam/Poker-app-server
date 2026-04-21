@@ -280,3 +280,96 @@ async fn list_structures_filters_by_malette_id() {
         assert_eq!(s["malette_id"], m1_id);
     }
 }
+
+#[tokio::test]
+async fn put_structure_regenerates_result_and_bumps_updated_at() {
+    let (app, _pool) = common::test_app().await;
+
+    let m = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "M", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let mid = read_json(m).await["id"].as_i64().unwrap();
+
+    let s = with_api_key(
+        app.clone(),
+        "POST",
+        "/structures",
+        Some(json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120})),
+    )
+    .await;
+    let created: serde_json::Value = read_json(s).await;
+    let sid = created["id"].as_i64().unwrap();
+    let old_updated = created["updated_at"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let res = with_api_key(
+        app,
+        "PUT",
+        &format!("/structures/{sid}"),
+        Some(json!({"malette_id": mid, "players": 8, "total_duration_minutes": 240})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let got: serde_json::Value = read_json(res).await;
+    assert_eq!(got["id"], sid);
+    assert_eq!(got["players"], 8);
+    assert_eq!(got["total_duration_minutes"], 240);
+    assert_ne!(got["updated_at"].as_str().unwrap(), old_updated);
+}
+
+#[tokio::test]
+async fn put_structure_missing_returns_404() {
+    let (app, _pool) = common::test_app().await;
+    let m = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "M", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let mid = read_json(m).await["id"].as_i64().unwrap();
+
+    let res = with_api_key(
+        app,
+        "PUT",
+        "/structures/9999",
+        Some(json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn put_structure_with_unknown_malette_returns_422() {
+    let (app, _pool) = common::test_app().await;
+    let m = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "M", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let mid = read_json(m).await["id"].as_i64().unwrap();
+    let s = with_api_key(
+        app.clone(),
+        "POST",
+        "/structures",
+        Some(json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120})),
+    )
+    .await;
+    let sid = read_json(s).await["id"].as_i64().unwrap();
+
+    let res = with_api_key(
+        app,
+        "PUT",
+        &format!("/structures/{sid}"),
+        Some(json!({"malette_id": 9999, "players": 4, "total_duration_minutes": 120})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
