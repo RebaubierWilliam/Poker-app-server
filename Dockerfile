@@ -13,6 +13,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && rm -rf src target/release/deps/poker_blind_timer_server*
 
 COPY src ./src
+COPY migrations ./migrations
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
