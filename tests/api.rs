@@ -234,3 +234,49 @@ async fn get_structure_missing_returns_404() {
     let res = with_api_key(app, "GET", "/structures/9999", None).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn list_structures_filters_by_malette_id() {
+    let (app, _pool) = common::test_app().await;
+
+    let m1 = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "A", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let m1_id = read_json(m1).await["id"].as_i64().unwrap();
+    let m2 = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "B", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let m2_id = read_json(m2).await["id"].as_i64().unwrap();
+
+    for mid in [m1_id, m1_id, m2_id] {
+        let body = json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120});
+        with_api_key(app.clone(), "POST", "/structures", Some(body)).await;
+    }
+
+    let all = with_api_key(app.clone(), "GET", "/structures", None).await;
+    assert_eq!(all.status(), StatusCode::OK);
+    assert_eq!(read_json(all).await.as_array().unwrap().len(), 3);
+
+    let filt = with_api_key(
+        app,
+        "GET",
+        &format!("/structures?malette_id={m1_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(filt.status(), StatusCode::OK);
+    let v = read_json(filt).await;
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    for s in arr {
+        assert_eq!(s["malette_id"], m1_id);
+    }
+}

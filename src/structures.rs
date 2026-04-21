@@ -155,10 +155,28 @@ async fn create(
 }
 
 async fn list(
-    State(_state): State<AppState>,
-    Query(_q): Query<ListQuery>,
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
 ) -> AppResult<Json<Vec<StructureOut>>> {
-    Err(AppError::Validation("list not implemented".into()))
+    let rows: Vec<StructureRow> = if let Some(mid) = q.malette_id {
+        sqlx::query_as(
+            "SELECT id, malette_id, players, total_duration_minutes, result, created_at, updated_at \
+             FROM structures WHERE malette_id = ?1 ORDER BY id ASC",
+        )
+        .bind(mid)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, malette_id, players, total_duration_minutes, result, created_at, updated_at \
+             FROM structures ORDER BY id ASC",
+        )
+        .fetch_all(&state.pool)
+        .await?
+    };
+    let out: Result<Vec<StructureOut>, AppError> =
+        rows.into_iter().map(StructureOut::try_from).collect();
+    Ok(Json(out?))
 }
 
 async fn get_one(
