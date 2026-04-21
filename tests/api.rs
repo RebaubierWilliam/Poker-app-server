@@ -373,3 +373,62 @@ async fn put_structure_with_unknown_malette_returns_422() {
     .await;
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn delete_structure_returns_204_then_404() {
+    let (app, _pool) = common::test_app().await;
+    let m = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "M", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let mid = read_json(m).await["id"].as_i64().unwrap();
+    let s = with_api_key(
+        app.clone(),
+        "POST",
+        "/structures",
+        Some(json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120})),
+    )
+    .await;
+    let sid = read_json(s).await["id"].as_i64().unwrap();
+
+    let res = with_api_key(app.clone(), "DELETE", &format!("/structures/{sid}"), None).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let res = with_api_key(app, "GET", &format!("/structures/{sid}"), None).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn deleting_malette_cascades_to_structures() {
+    let (app, _pool) = common::test_app().await;
+
+    let m = with_api_key(
+        app.clone(),
+        "POST",
+        "/malettes",
+        Some(json!({"name": "M", "chips": [{"value": 25, "count": 100}]})),
+    )
+    .await;
+    let mid = read_json(m).await["id"].as_i64().unwrap();
+    for _ in 0..3 {
+        with_api_key(
+            app.clone(),
+            "POST",
+            "/structures",
+            Some(json!({"malette_id": mid, "players": 4, "total_duration_minutes": 120})),
+        )
+        .await;
+    }
+
+    let all = with_api_key(app.clone(), "GET", "/structures", None).await;
+    assert_eq!(read_json(all).await.as_array().unwrap().len(), 3);
+
+    let d = with_api_key(app.clone(), "DELETE", &format!("/malettes/{mid}"), None).await;
+    assert_eq!(d.status(), StatusCode::NO_CONTENT);
+
+    let after = with_api_key(app, "GET", "/structures", None).await;
+    assert_eq!(read_json(after).await.as_array().unwrap().len(), 0);
+}

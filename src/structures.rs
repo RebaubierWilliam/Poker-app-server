@@ -236,8 +236,15 @@ async fn update(
 }
 
 async fn delete_one(
-    State(_state): State<AppState>,
-    Path(_id): Path<i64>,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
-    Err(AppError::Validation("delete_one not implemented".into()))
+    let res = sqlx::query("DELETE FROM structures WHERE id = ?1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
