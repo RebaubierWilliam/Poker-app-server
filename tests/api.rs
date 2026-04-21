@@ -432,3 +432,49 @@ async fn deleting_malette_cascades_to_structures() {
     let after = with_api_key(app, "GET", "/structures", None).await;
     assert_eq!(read_json(after).await.as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn missing_api_key_on_protected_route_returns_401() {
+    let (app, _pool) = common::test_app().await;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/malettes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wrong_api_key_returns_401() {
+    let (app, _pool) = common::test_app().await;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/malettes")
+                .header("x-api-key", "not-the-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn health_is_reachable_without_api_key() {
+    let (app, _pool) = common::test_app().await;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
