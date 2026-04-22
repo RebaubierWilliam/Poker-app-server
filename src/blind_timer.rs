@@ -63,10 +63,9 @@ const SB_LADDER_UNITS: &[u32] = &[
 const MIN_DEPTH_BB: u32 = 60;
 const MAX_DEPTH_BB: u32 = 150;
 
-/// Part (en %) de la **valeur** du stack allouée à la 2e dénomination.
-/// 60 % en v2 pour limiter le nb physique de jetons, 40 % en v1 pour payer
-/// les petites blinds.
-const V2_VALUE_SHARE_PCT: u32 = 60;
+/// Nombre maximal de dénominations distribuées dans le stack de départ.
+/// Au-delà, les dénominations plus grosses sont réservées aux recolorages.
+const MAX_DENOMS_IN_STACK: usize = 4;
 
 /// Nombre minimal de jetons v1 gardés par joueur (pour payer SB/BB bas).
 const MIN_V1_COUNT: u32 = 4;
@@ -196,8 +195,14 @@ fn target_depth_bb(players: u32, duration_minutes: u32) -> u32 {
         .clamp(MIN_DEPTH_BB, MAX_DEPTH_BB)
 }
 
-/// Alloue le stack de départ à partir des 2 plus petites dénominations
-/// disponibles dans la malette, en visant `depth_bb × bb1`.
+/// Alloue le stack de départ à partir des N plus petites dénominations
+/// disponibles dans la malette (N ≤ [`MAX_DENOMS_IN_STACK`]), en visant
+/// `depth_bb × bb1`.
+///
+/// Répartition géométrique des parts de **valeur** : poids 1 pour v1, 2 pour
+/// v2, 4 pour v3, 8 pour v4. Ça met le gros de la valeur dans les grosses
+/// coupures (moins de jetons physiques) tout en gardant assez de petites
+/// coupures pour payer les blinds basses.
 ///
 /// Retourne `(chips_per_player, starting_stack, bb1)` avec `bb1 = 2 × v1`.
 fn allocate_stack(
@@ -210,72 +215,81 @@ fn allocate_stack(
         return (Vec::new(), 0, 1);
     }
 
+    let use_n = denoms.len().min(MAX_DENOMS_IN_STACK);
     let v1 = denoms[0].value;
-    let max_v1 = denoms[0].count / players;
     let bb1 = v1.saturating_mul(2);
-    let target = depth_bb.saturating_mul(bb1);
 
-    // Cas dégénéré : 1 seule dénomination → on distribue dans la limite cible+dispo.
-    if denoms.len() == 1 {
-        let want = (target + v1 / 2) / v1;
-        let count_v1 = want.min(max_v1);
-        let chips = if count_v1 > 0 {
-            vec![ChipDenomination { value: v1, count: count_v1 }]
-        } else {
-            Vec::new()
-        };
-        return (chips, count_v1 * v1, bb1);
+    // Disponible par joueur pour chaque dénomination utilisée.
+    let available: Vec<u32> = denoms[..use_n]
+        .iter()
+        .map(|d| d.count / players)
+        .collect();
+
+    // Plafond que la malette peut fournir avec ces N dénominations.
+    let ceiling: u32 = denoms[..use_n]
+        .iter()
+        .zip(&available)
+        .map(|(d, &a)| a.saturating_mul(d.value))
+        .sum();
+
+    // Cible = profondeur × bb1, bornée par le plafond malette.
+    let target = depth_bb.saturating_mul(bb1).min(ceiling);
+
+    // Poids géométriques : 1, 2, 4, 8 — total 2^N - 1.
+    let weights: Vec<u32> = (0..use_n).map(|i| 1u32 << i).collect();
+    let total_weight: u32 = weights.iter().sum();
+
+    // Allocation initiale selon les parts.
+    let mut counts = vec![0u32; use_n];
+    for i in 0..use_n {
+        let v = denoms[i].value;
+        let share_value = target.saturating_mul(weights[i]) / total_weight.max(1);
+        let want = (share_value + v / 2) / v;
+        counts[i] = want.min(available[i]);
     }
 
-    let v2 = denoms[1].value;
-    let max_v2 = denoms[1].count / players;
-
-    // Cible bornée par ce que la malette peut fournir.
-    let ceiling = max_v1.saturating_mul(v1).saturating_add(max_v2.saturating_mul(v2));
-    let target = target.min(ceiling);
-
-    // Répartition 40 % v1 / 60 % v2 en **valeur**, plafonnée par les dispos.
-    let target_v2_value = target.saturating_mul(V2_VALUE_SHARE_PCT) / 100;
-    let mut count_v2 = (target_v2_value + v2 / 2) / v2;
-    count_v2 = count_v2.min(max_v2);
-
-    let remaining = target.saturating_sub(count_v2.saturating_mul(v2));
-    let mut count_v1 = (remaining + v1 / 2) / v1;
-    count_v1 = count_v1.min(max_v1);
-
-    // Top-up pour s'approcher de la cible. On préfère v2 (moins de jetons
-    // physiques par unité de valeur) puis v1.
-    let mut achieved = count_v1 * v1 + count_v2 * v2;
-    while achieved < target {
+    // Top-up : on approche la cible en ajoutant depuis la plus grosse
+    // dénomination (moins de jetons physiques), sans dépasser franchement
+    // la cible ni la dispo.
+    let value_of =
+        |cs: &[u32]| -> u32 { cs.iter().zip(denoms[..use_n].iter()).map(|(c, d)| c * d.value).sum() };
+    let mut achieved = value_of(&counts);
+    loop {
+        if achieved >= target {
+            break;
+        }
         let need = target - achieved;
-        if count_v2 < max_v2 && need >= v2 / 2 {
-            count_v2 += 1;
-            achieved = count_v1 * v1 + count_v2 * v2;
-            continue;
+        let mut progressed = false;
+        for i in (0..use_n).rev() {
+            let v = denoms[i].value;
+            if counts[i] < available[i] && need >= v / 2 {
+                counts[i] += 1;
+                achieved += v;
+                progressed = true;
+                break;
+            }
         }
-        if count_v1 < max_v1 {
-            let add = ((need + v1 / 2) / v1).min(max_v1 - count_v1).max(1);
-            count_v1 += add;
-            achieved = count_v1 * v1 + count_v2 * v2;
-            continue;
+        if !progressed {
+            break;
         }
-        break;
     }
 
-    // Minimum de petits jetons pour payer SB/BB.
-    let min_v1 = MIN_V1_COUNT.min(max_v1);
-    if count_v1 < min_v1 {
-        count_v1 = min_v1;
-        achieved = count_v1 * v1 + count_v2 * v2;
+    // Garantir un minimum de petits jetons (v1) pour payer les blinds basses.
+    let min_v1 = MIN_V1_COUNT.min(available[0]);
+    if counts[0] < min_v1 {
+        counts[0] = min_v1;
+        achieved = value_of(&counts);
     }
 
-    let mut chips = Vec::with_capacity(2);
-    if count_v1 > 0 {
-        chips.push(ChipDenomination { value: v1, count: count_v1 });
-    }
-    if count_v2 > 0 {
-        chips.push(ChipDenomination { value: v2, count: count_v2 });
-    }
+    let chips: Vec<ChipDenomination> = denoms[..use_n]
+        .iter()
+        .zip(&counts)
+        .filter(|(_, &c)| c > 0)
+        .map(|(d, &c)| ChipDenomination {
+            value: d.value,
+            count: c,
+        })
+        .collect();
 
     (chips, achieved, bb1)
 }
@@ -326,6 +340,27 @@ fn find_ladder_index(target_sb: u32, unit: u32) -> usize {
 mod tests {
     use super::*;
 
+    fn standard_malette_chips() -> Vec<ChipDenomination> {
+        vec![
+            ChipDenomination { value: 25, count: 100 },
+            ChipDenomination { value: 100, count: 100 },
+            ChipDenomination { value: 500, count: 50 },
+            ChipDenomination { value: 1000, count: 25 },
+        ]
+    }
+
+    fn server_malette_chips() -> Vec<ChipDenomination> {
+        vec![
+            ChipDenomination { value: 1, count: 150 },
+            ChipDenomination { value: 5, count: 150 },
+            ChipDenomination { value: 10, count: 50 },
+            ChipDenomination { value: 25, count: 25 },
+            ChipDenomination { value: 100, count: 50 },
+            ChipDenomination { value: 500, count: 50 },
+            ChipDenomination { value: 1000, count: 25 },
+        ]
+    }
+
     /// Malette typique 500 jetons pour 9 joueurs.
     fn standard_input() -> TournamentInput {
         TournamentInput {
@@ -358,11 +393,26 @@ mod tests {
     }
 
     #[test]
-    fn uses_only_two_smallest_denominations() {
+    fn uses_up_to_four_smallest_denominations() {
+        // Malette standard a 4 dénominations — toutes doivent être utilisées.
         let s = compute_structure(&standard_input());
-        assert_eq!(s.chips_per_player.len(), 2);
+        assert!(
+            (2..=MAX_DENOMS_IN_STACK).contains(&s.chips_per_player.len()),
+            "stack doit utiliser 2 à 4 dénominations, a {}",
+            s.chips_per_player.len()
+        );
         let values: Vec<u32> = s.chips_per_player.iter().map(|c| c.value).collect();
-        assert_eq!(values, vec![25, 100]);
+        // Ce doit être un préfixe trié ascendant des dénominations.
+        assert_eq!(values, vec![25, 100, 500, 1000]);
+    }
+
+    #[test]
+    fn malette_with_more_than_four_denoms_uses_four_smallest() {
+        // Malette serveur a 7 dénominations (1,5,10,25,100,500,1000) — on ne
+        // doit en distribuer que les 4 plus petites.
+        let s = compute_structure(&server_malette_5p(120));
+        let values: Vec<u32> = s.chips_per_player.iter().map(|c| c.value).collect();
+        assert_eq!(values, vec![1, 5, 10, 25]);
     }
 
     #[test]
@@ -392,17 +442,19 @@ mod tests {
 
     #[test]
     fn starting_stack_respects_malette_availability() {
-        // 100/9=11 dispo pour 25, 100/9=11 dispo pour 100 → plafond 1375.
+        // 9 joueurs × (11×25 + 11×100 + 5×500 + 2×1000) = plafond 5875 par joueur.
         let s = compute_structure(&standard_input());
         assert!(
-            s.starting_stack <= 1375,
-            "stack {} > plafond malette 1375",
+            s.starting_stack <= 5875,
+            "stack {} > plafond malette 5875",
             s.starting_stack
         );
         for chip in &s.chips_per_player {
             match chip.value {
-                25 => assert!(chip.count <= 11),
-                100 => assert!(chip.count <= 11),
+                25 => assert!(chip.count <= 11, "25: {}", chip.count),
+                100 => assert!(chip.count <= 11, "100: {}", chip.count),
+                500 => assert!(chip.count <= 5, "500: {}", chip.count),
+                1000 => assert!(chip.count <= 2, "1000: {}", chip.count),
                 v => panic!("dénomination inattendue {v}"),
             }
         }
@@ -508,11 +560,18 @@ mod tests {
     /// Aperçu : `cargo test preview_output -- --nocapture`.
     #[test]
     fn preview_output() {
-        for (players, total) in [(5, 5), (5, 30), (5, 60), (5, 120), (9, 240)] {
+        let scenarios: &[(u32, u32, &[ChipDenomination])] = &[
+            (5, 5, &server_malette_chips()),
+            (5, 60, &server_malette_chips()),
+            (5, 120, &server_malette_chips()),
+            (9, 240, &server_malette_chips()),
+            (9, 240, &standard_malette_chips()),
+        ];
+        for (players, total, chips) in scenarios {
             let input = TournamentInput {
-                players,
-                total_duration_minutes: total,
-                case_chips: server_malette_5p(0).case_chips,
+                players: *players,
+                total_duration_minutes: *total,
+                case_chips: chips.to_vec(),
             };
             let s = compute_structure(&input);
             eprintln!(
