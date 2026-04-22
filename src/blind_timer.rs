@@ -59,9 +59,16 @@ const SB_LADDER_UNITS: &[u32] = &[
     20000, 25000, 30000, 40000, 50000,
 ];
 
-/// Profondeur minimale/maximale du stack de départ en big blinds.
-const MIN_DEPTH_BB: u32 = 60;
+/// Profondeur minimale/maximale cible par la formule de `target_depth_bb`.
+/// Les profondeurs sont toujours arrondies à un multiple de [`DEPTH_STEP_BB`]
+/// (ex. 100, 110, 120, …, 150 BB).
+const MIN_DEPTH_BB: u32 = 100;
 const MAX_DEPTH_BB: u32 = 150;
+const DEPTH_STEP_BB: u32 = 10;
+/// Plancher absolu en BB quand la malette ne peut pas fournir
+/// [`MIN_DEPTH_BB`] : on décrémente par pas de 10 BB jusqu'à trouver une cible
+/// atteignable, mais jamais en dessous de ce plancher.
+const FLOOR_DEPTH_BB: u32 = 20;
 
 /// Nombre maximal de dénominations distribuées dans le stack de départ.
 /// Au-delà, les dénominations plus grosses sont réservées aux recolorages.
@@ -178,31 +185,42 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
 }
 
 /// Profondeur cible du stack en big blinds, dépendant de la durée et du nombre
-/// de joueurs.
+/// de joueurs, **arrondie au multiple de 10** (100, 110, 120, …).
 ///
-/// Formule : `duration_min / 3 + log2(players) * 10`, bornée à \[60, 150\].
+/// Formule : `duration_min / 3 + log2(players) * 10`, bornée à
+/// \[[`MIN_DEPTH_BB`], [`MAX_DEPTH_BB`]\], puis arrondie au multiple de
+/// [`DEPTH_STEP_BB`] le plus proche.
 ///
 /// Justification :
-/// - Base ∝ durée : ~60 BB pour 3h de base.
+/// - Base ∝ durée.
 /// - Bonus ∝ log₂(N) : Harrington — un joueur doit doubler log₂(N) fois pour
 ///   gagner ; +10 BB par doublement compense la longueur structurelle requise.
-/// - Bornes \[60, 150\] : en dessous = turbo, au delà = deep (peu home-game).
+/// - Arrondi à 10 BB pour avoir un chiffre rond (100/110/120…).
 fn target_depth_bb(players: u32, duration_minutes: u32) -> u32 {
     let base = duration_minutes / 3;
     let log2_players = (players.max(2) as f64).log2();
     let bonus = (log2_players * 10.0).round() as u32;
-    base.saturating_add(bonus)
-        .clamp(MIN_DEPTH_BB, MAX_DEPTH_BB)
+    let raw = base
+        .saturating_add(bonus)
+        .clamp(MIN_DEPTH_BB, MAX_DEPTH_BB);
+    let step = DEPTH_STEP_BB.max(1);
+    // Arrondi au pas le plus proche, avec clamp pour ne pas sortir des bornes.
+    let snapped = ((raw + step / 2) / step) * step;
+    snapped.clamp(MIN_DEPTH_BB, MAX_DEPTH_BB)
 }
 
 /// Alloue le stack de départ à partir des N plus petites dénominations
-/// disponibles dans la malette (N ≤ [`MAX_DENOMS_IN_STACK`]), en visant
-/// `depth_bb × bb1`.
+/// disponibles dans la malette (N ≤ [`MAX_DENOMS_IN_STACK`]). Vise **exactement**
+/// `depth_bb × bb1`. Si la malette ne permet pas cette cible ronde, décrémente
+/// la profondeur par pas de [`DEPTH_STEP_BB`] jusqu'à trouver une cible
+/// atteignable.
 ///
-/// Répartition géométrique des parts de **valeur** : poids 1 pour v1, 2 pour
-/// v2, 4 pour v3, 8 pour v4. Ça met le gros de la valeur dans les grosses
-/// coupures (moins de jetons physiques) tout en gardant assez de petites
-/// coupures pour payer les blinds basses.
+/// Privilégie les **petits jetons** : parmi toutes les compositions atteignant
+/// la cible exacte, choisit celle qui maximise count(v1), puis count(v2), etc.
+///
+/// Garantit au moins **1 jeton de chaque dénomination** disponible (visibilité
+/// ≥4 couleurs), et un minimum de [`MIN_V1_COUNT`] petits jetons quand
+/// possible.
 ///
 /// Retourne `(chips_per_player, starting_stack, bb1)` avec `bb1 = 2 × v1`.
 fn allocate_stack(
@@ -215,82 +233,135 @@ fn allocate_stack(
         return (Vec::new(), 0, 1);
     }
 
-    let use_n = denoms.len().min(MAX_DENOMS_IN_STACK);
-    let v1 = denoms[0].value;
+    // Dénoms effectivement utilisables (count/players ≥ 1), limitées aux N plus petites.
+    let mut usable: Vec<&ChipDenomination> = denoms
+        .iter()
+        .filter(|d| d.count / players >= 1)
+        .copied()
+        .collect();
+    if usable.is_empty() {
+        return (Vec::new(), 0, 2 * denoms[0].value);
+    }
+    usable.truncate(MAX_DENOMS_IN_STACK);
+
+    let values: Vec<u32> = usable.iter().map(|d| d.value).collect();
+    let available: Vec<u32> = usable.iter().map(|d| d.count / players).collect();
+
+    let v1 = values[0];
     let bb1 = v1.saturating_mul(2);
 
-    // Disponible par joueur pour chaque dénomination utilisée.
-    let available: Vec<u32> = denoms[..use_n]
-        .iter()
-        .map(|d| d.count / players)
-        .collect();
-
-    // Plafond que la malette peut fournir avec ces N dénominations.
-    let ceiling: u32 = denoms[..use_n]
-        .iter()
-        .zip(&available)
-        .map(|(d, &a)| a.saturating_mul(d.value))
-        .sum();
-
-    // Cible = profondeur × bb1, bornée par le plafond malette.
-    let target = depth_bb.saturating_mul(bb1).min(ceiling);
-
-    // Poids géométriques : 1, 2, 4, 8 — total 2^N - 1.
-    let weights: Vec<u32> = (0..use_n).map(|i| 1u32 << i).collect();
-    let total_weight: u32 = weights.iter().sum();
-
-    // Allocation initiale selon les parts.
-    let mut counts = vec![0u32; use_n];
-    for i in 0..use_n {
-        let v = denoms[i].value;
-        let share_value = target.saturating_mul(weights[i]) / total_weight.max(1);
-        let want = (share_value + v / 2) / v;
-        counts[i] = want.min(available[i]);
-    }
-
-    // Top-up : on approche la cible en ajoutant depuis la plus grosse
-    // dénomination (moins de jetons physiques), sans dépasser franchement
-    // la cible ni la dispo.
-    let value_of =
-        |cs: &[u32]| -> u32 { cs.iter().zip(denoms[..use_n].iter()).map(|(c, d)| c * d.value).sum() };
-    let mut achieved = value_of(&counts);
+    // Essaye la profondeur demandée, puis décrémente par pas de 10 BB jusqu'à
+    // trouver une cible atteignable avec au moins 1 jeton de chaque dénom.
+    // Va jusqu'à FLOOR_DEPTH_BB pour les malettes très contraintes.
+    let mut depth = depth_bb.max(FLOOR_DEPTH_BB);
     loop {
-        if achieved >= target {
+        let target = depth.saturating_mul(bb1);
+        if let Some(counts) = find_small_first_composition(&values, &available, target) {
+            let chips: Vec<ChipDenomination> = values
+                .iter()
+                .zip(&counts)
+                .filter(|(_, &c)| c > 0)
+                .map(|(&v, &c)| ChipDenomination { value: v, count: c })
+                .collect();
+            let achieved: u32 =
+                values.iter().zip(&counts).map(|(v, c)| v * c).sum();
+            return (chips, achieved, bb1);
+        }
+        if depth <= FLOOR_DEPTH_BB {
             break;
         }
-        let need = target - achieved;
-        let mut progressed = false;
-        for i in (0..use_n).rev() {
-            let v = denoms[i].value;
-            if counts[i] < available[i] && need >= v / 2 {
-                counts[i] += 1;
-                achieved += v;
-                progressed = true;
-                break;
+        depth = depth.saturating_sub(DEPTH_STEP_BB).max(FLOOR_DEPTH_BB);
+    }
+
+    // Fallback : aucune profondeur ronde ≥ FLOOR_DEPTH_BB n'est atteignable
+    // exactement avec 1+ jetons de chaque dénom — malette très limitée.
+    greedy_fallback(&values, &available, FLOOR_DEPTH_BB.saturating_mul(bb1), bb1)
+}
+
+/// Cherche une composition `counts[i]` telle que `Σ counts[i] × values[i] = target`,
+/// avec `1 ≤ counts[i] ≤ available[i]` pour chaque dénomination.
+///
+/// Maximise `counts[0]` (plus de petits jetons), puis `counts[1]`, etc.
+/// (ordre lexicographique). Retourne `None` si aucune solution exacte n'existe.
+fn find_small_first_composition(
+    values: &[u32],
+    available: &[u32],
+    target: u32,
+) -> Option<Vec<u32>> {
+    let n = values.len();
+    if n == 0 {
+        return if target == 0 { Some(Vec::new()) } else { None };
+    }
+    let v0 = values[0];
+    let max0 = available[0];
+
+    // Plancher de petits jetons (v1) : au moins MIN_V1_COUNT si dispo.
+    // Pour les dénoms suivants : au moins 1 (visibilité ≥4 couleurs).
+    let min0 = if n == 1 { 1 } else { MIN_V1_COUNT.min(max0).max(1) };
+
+    if n == 1 {
+        if target % v0 == 0 {
+            let c = target / v0;
+            if c >= min0 && c <= max0 {
+                return Some(vec![c]);
             }
         }
-        if !progressed {
+        return None;
+    }
+
+    // Parcourt c0 de max à min pour privilégier beaucoup de petits jetons.
+    let mut c0 = max0;
+    loop {
+        if let Some(rem) = target.checked_sub(c0 * v0) {
+            if let Some(sub) = find_small_first_composition(&values[1..], &available[1..], rem) {
+                let mut full = Vec::with_capacity(n);
+                full.push(c0);
+                full.extend(sub);
+                return Some(full);
+            }
+        }
+        if c0 <= min0 {
             break;
         }
+        c0 -= 1;
+    }
+    None
+}
+
+/// Fallback quand aucune cible ronde n'est atteignable : greedy best-effort
+/// qui s'approche d'un stack minimal en préférant les petits jetons.
+fn greedy_fallback(
+    values: &[u32],
+    available: &[u32],
+    target: u32,
+    bb1: u32,
+) -> (Vec<ChipDenomination>, u32, u32) {
+    let mut counts = vec![0u32; values.len()];
+    for i in 0..values.len() {
+        if available[i] >= 1 && values[i] <= target {
+            counts[i] = 1;
+        }
+    }
+    let mut achieved: u32 = values.iter().zip(&counts).map(|(v, c)| v * c).sum();
+
+    // Remplit en priorité les plus petites, jusqu'à la cible.
+    for i in 0..values.len() {
+        if counts[i] >= available[i] || achieved >= target {
+            continue;
+        }
+        let slack_global = (target - achieved) / values[i];
+        let slack_avail = available[i] - counts[i];
+        let add = slack_global.min(slack_avail);
+        counts[i] += add;
+        achieved += add * values[i];
     }
 
-    // Garantir un minimum de petits jetons (v1) pour payer les blinds basses.
-    let min_v1 = MIN_V1_COUNT.min(available[0]);
-    if counts[0] < min_v1 {
-        counts[0] = min_v1;
-        achieved = value_of(&counts);
-    }
-
-    let chips: Vec<ChipDenomination> = denoms[..use_n]
+    let chips: Vec<ChipDenomination> = values
         .iter()
         .zip(&counts)
         .filter(|(_, &c)| c > 0)
-        .map(|(d, &c)| ChipDenomination {
-            value: d.value,
-            count: c,
-        })
+        .map(|(&v, &c)| ChipDenomination { value: v, count: c })
         .collect();
-
     (chips, achieved, bb1)
 }
 
@@ -555,6 +626,63 @@ mod tests {
         assert!(target_depth_bb(8, 300) >= target_depth_bb(8, 60));
         assert!(target_depth_bb(2, 1) >= MIN_DEPTH_BB);
         assert!(target_depth_bb(100, 10_000) <= MAX_DEPTH_BB);
+    }
+
+    #[test]
+    fn depth_is_always_a_round_number_of_bb() {
+        for players in [2u32, 5, 8, 9, 16, 32] {
+            for duration in [5u32, 30, 60, 120, 240, 480, 720] {
+                let d = target_depth_bb(players, duration);
+                assert_eq!(
+                    d % DEPTH_STEP_BB,
+                    0,
+                    "profondeur {} BB pas ronde (players={}, dur={})",
+                    d,
+                    players,
+                    duration
+                );
+                assert!(d >= MIN_DEPTH_BB && d <= MAX_DEPTH_BB);
+            }
+        }
+    }
+
+    #[test]
+    fn starting_stack_hits_round_bb_when_malette_allows() {
+        // Malette standard a largement de quoi fournir la profondeur cible.
+        let s = compute_structure(&standard_input());
+        let first = s.levels.iter().find(|l| !l.is_break).unwrap();
+        let depth_bb = s.starting_stack / first.big_blind;
+        assert_eq!(
+            depth_bb * first.big_blind,
+            s.starting_stack,
+            "stack {} doit être un multiple entier de BB1={}",
+            s.starting_stack,
+            first.big_blind
+        );
+        assert_eq!(
+            depth_bb % DEPTH_STEP_BB,
+            0,
+            "profondeur {} BB pas ronde",
+            depth_bb
+        );
+    }
+
+    #[test]
+    fn stack_has_more_small_chips_than_big_ones() {
+        // Avec malette standard, les poids favorisent v1 (plus petit) → plus de
+        // petits que de gros (sauf saturation malette).
+        let s = compute_structure(&standard_input());
+        assert!(s.chips_per_player.len() >= 2);
+        let smallest = s.chips_per_player.first().unwrap();
+        let largest = s.chips_per_player.last().unwrap();
+        assert!(
+            smallest.count >= largest.count,
+            "plus petit jeton ({}) = {} count, plus gros ({}) = {} count",
+            smallest.value,
+            smallest.count,
+            largest.value,
+            largest.count
+        );
     }
 
     /// Aperçu : `cargo test preview_output -- --nocapture`.
