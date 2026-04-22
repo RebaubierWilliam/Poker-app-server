@@ -256,7 +256,7 @@ fn allocate_stack(
     let mut depth = depth_bb.max(FLOOR_DEPTH_BB);
     loop {
         let target = depth.saturating_mul(bb1);
-        if let Some(counts) = find_small_first_composition(&values, &available, target) {
+        if let Some(counts) = find_smooth_composition(&values, &available, target) {
             let chips: Vec<ChipDenomination> = values
                 .iter()
                 .zip(&counts)
@@ -279,11 +279,19 @@ fn allocate_stack(
 }
 
 /// Cherche une composition `counts[i]` telle que `Σ counts[i] × values[i] = target`,
-/// avec `1 ≤ counts[i] ≤ available[i]` pour chaque dénomination.
+/// avec `1 ≤ counts[i] ≤ available[i]` et contrainte de **décroissance** des
+/// counts (`counts[0] ≥ counts[1] ≥ … ≥ counts[n-1]`) — plus de petits jetons
+/// que de gros.
 ///
-/// Maximise `counts[0]` (plus de petits jetons), puis `counts[1]`, etc.
-/// (ordre lexicographique). Retourne `None` si aucune solution exacte n'existe.
-fn find_small_first_composition(
+/// Parmi toutes les compositions valides, choisit celle qui **lisse** le mieux
+/// la courbe des quantités : minimise le plus gros ratio entre deux comptages
+/// consécutifs (`max_i counts[i] / counts[i+1]`). Tie-breaker : total de
+/// jetons physiques plus petit.
+///
+/// Exemple pour target=200, malette 1/5/10/25 (dispo 30/30/10/5) :
+/// - `(15, 10, 6, 3)` — ratio max = 2.0 ✓ (gagne)
+/// - `(30, 21, 4, 1)` — ratio max = 5.25 (rejeté, courbe en escalier)
+fn find_smooth_composition(
     values: &[u32],
     available: &[u32],
     target: u32,
@@ -292,40 +300,124 @@ fn find_small_first_composition(
     if n == 0 {
         return if target == 0 { Some(Vec::new()) } else { None };
     }
+
     let v0 = values[0];
     let max0 = available[0];
-
-    // Plancher de petits jetons (v1) : au moins MIN_V1_COUNT si dispo.
-    // Pour les dénoms suivants : au moins 1 (visibilité ≥4 couleurs).
-    let min0 = if n == 1 { 1 } else { MIN_V1_COUNT.min(max0).max(1) };
+    let min_v1 = MIN_V1_COUNT.min(max0).max(1);
 
     if n == 1 {
         if target % v0 == 0 {
             let c = target / v0;
-            if c >= min0 && c <= max0 {
+            if c >= min_v1 && c <= max0 {
                 return Some(vec![c]);
             }
         }
         return None;
     }
 
-    // Parcourt c0 de max à min pour privilégier beaucoup de petits jetons.
-    let mut c0 = max0;
-    loop {
-        if let Some(rem) = target.checked_sub(c0 * v0) {
-            if let Some(sub) = find_small_first_composition(&values[1..], &available[1..], rem) {
-                let mut full = Vec::with_capacity(n);
-                full.push(c0);
-                full.extend(sub);
-                return Some(full);
+    let mut counts = vec![0u32; n];
+    let mut best: Option<(Vec<u32>, CompScore)> = None;
+
+    enumerate_smooth(
+        n - 1,
+        &mut counts,
+        values,
+        available,
+        target,
+        min_v1,
+        &mut best,
+    );
+
+    best.map(|(c, _)| c)
+}
+
+/// Score de qualité d'une composition. Plus petit = meilleur. Ordre
+/// lexicographique : (ratio max entre counts consécutifs ×1000, total jetons,
+/// count[0]).
+type CompScore = (u64, u32, u32);
+
+fn compute_smoothness_score(counts: &[u32]) -> CompScore {
+    let mut max_ratio_scaled = 1_000u64; // 1.0 × 1000
+    for i in 0..counts.len().saturating_sub(1) {
+        let (hi, lo) = (counts[i], counts[i + 1]);
+        if lo > 0 && hi > 0 {
+            let r = (hi as u64 * 1000) / lo as u64;
+            if r > max_ratio_scaled {
+                max_ratio_scaled = r;
             }
         }
-        if c0 <= min0 {
-            break;
-        }
-        c0 -= 1;
     }
-    None
+    let total: u32 = counts.iter().sum();
+    let c0 = *counts.first().unwrap_or(&0);
+    (max_ratio_scaled, total, c0)
+}
+
+/// Énumère récursivement toutes les compositions valides et retient la
+/// meilleure selon [`compute_smoothness_score`].
+///
+/// Parcourt les counts **du dernier index (plus gros jeton, plus petit count)
+/// vers le 1er** ; le count de v1 (idx 0) est dérivé par différence pour
+/// garantir une somme exacte.
+fn enumerate_smooth(
+    idx: usize,
+    counts: &mut Vec<u32>,
+    values: &[u32],
+    available: &[u32],
+    target: u32,
+    min_v1: u32,
+    best: &mut Option<(Vec<u32>, CompScore)>,
+) {
+    let n = values.len();
+
+    if idx == 0 {
+        // Dérive count[0] par complément.
+        let fixed: u32 = (1..n).map(|i| counts[i] * values[i]).sum();
+        let Some(rem) = target.checked_sub(fixed) else {
+            return;
+        };
+        if rem % values[0] != 0 {
+            return;
+        }
+        let c0 = rem / values[0];
+        // Doit respecter min_v1, availability, et c0 ≥ c1 (décroissance).
+        let min_c0 = counts.get(1).copied().unwrap_or(1).max(min_v1);
+        if c0 < min_c0 || c0 > available[0] {
+            return;
+        }
+        counts[0] = c0;
+        let score = compute_smoothness_score(counts);
+        match best {
+            None => *best = Some((counts.clone(), score)),
+            Some((_, s)) if score < *s => *best = Some((counts.clone(), score)),
+            _ => {}
+        }
+        return;
+    }
+
+    // Pour idx ≥ 1, itère de min_c à max_c.
+    // min_c : ≥ counts[idx+1] (décroissance). Si idx == n-1, min_c = 1.
+    // max_c : availability[idx].
+    let lower_from_desc = if idx + 1 < n { counts[idx + 1] } else { 0 };
+    let min_c = lower_from_desc.max(1);
+    let max_c = available[idx];
+    if min_c > max_c {
+        return;
+    }
+
+    // Borne sup supplémentaire : ce qui peut rester pour v0..v_{idx-1}.
+    // counts[idx] * values[idx] ≤ target − Σ_{j>idx} counts[j]*values[j].
+    let already_fixed: u32 = ((idx + 1)..n).map(|i| counts[i] * values[i]).sum();
+    let budget = target.saturating_sub(already_fixed);
+    let cap_from_budget = budget / values[idx];
+    let max_c = max_c.min(cap_from_budget);
+    if min_c > max_c {
+        return;
+    }
+
+    for c in min_c..=max_c {
+        counts[idx] = c;
+        enumerate_smooth(idx - 1, counts, values, available, target, min_v1, best);
+    }
 }
 
 /// Fallback quand aucune cible ronde n'est atteignable : greedy best-effort
