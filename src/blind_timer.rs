@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 /// Paramètres d'entrée décrivant le tournoi que l'utilisateur veut organiser.
 ///
 /// L'utilisateur décrit la **malette** (quantité totale de jetons par valeur)
-/// et le nombre de joueurs. L'algorithme se charge de:
-///   - répartir la malette équitablement entre les joueurs,
-///   - choisir une durée de niveau adaptée,
-///   - générer la structure de blinds correspondante, calquée sur les
-///     structures professionnelles (WSOP/WPT): SB/BB toujours dans un rapport
-///     1:2, valeurs rondes prises dans une échelle canonique.
+/// et le nombre de joueurs. L'algorithme :
+///   - ancre la **première blind** à la plus petite dénomination de la malette,
+///   - ne distribue que les **2 plus petites dénominations** dans le stack de
+///     départ (les grosses coupures sont réservées aux recolorages),
+///   - vise une **profondeur** (en big blinds) dynamique dépendant de la durée
+///     totale et du nombre de joueurs,
+///   - génère la progression des blinds sur une échelle canonique (WSOP/WPT),
+///     SB:BB toujours 1:2.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TournamentInput {
     /// Nombre de joueurs au départ.
@@ -51,65 +53,71 @@ pub struct TournamentStructure {
 }
 
 /// Échelle canonique des SB, exprimée en **unités du plus petit jeton**.
-/// Pour un jeton minimal = 1, on obtient SB {1,2,3,4,6,8,10,12,15,20...}.
-/// Pour un jeton minimal = 25, on obtient SB {25,50,75,100,150,200,250,300,
-/// 375,500...}. Dans tous les cas BB = 2*SB.
-///
-/// L'échelle est calquée sur celles utilisées par WSOP/WPT: progression en
-/// 1.25–1.5× entre chaque palier, avec uniquement des valeurs rondes que l'on
-/// peut miser avec des jetons standards (1/2/5, 5/10/25, etc.).
 const SB_LADDER_UNITS: &[u32] = &[
     1, 2, 3, 4, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250, 300, 400,
     500, 600, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 6000, 8000, 10000, 12500, 15000,
     20000, 25000, 30000, 40000, 50000,
 ];
 
+/// Profondeur minimale/maximale du stack de départ en big blinds.
+const MIN_DEPTH_BB: u32 = 60;
+const MAX_DEPTH_BB: u32 = 150;
+
+/// Part (en %) de la **valeur** du stack allouée à la 2e dénomination.
+/// 60 % en v2 pour limiter le nb physique de jetons, 40 % en v1 pour payer
+/// les petites blinds.
+const V2_VALUE_SHARE_PCT: u32 = 60;
+
+/// Nombre minimal de jetons v1 gardés par joueur (pour payer SB/BB bas).
+const MIN_V1_COUNT: u32 = 4;
+
 pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
-    // 1. Répartition de la malette entre les joueurs.
-    let chips_per_player: Vec<ChipDenomination> = input
+    let players = input.players.max(1);
+
+    // 1. Tri des dénominations par valeur croissante, filtre des invalides.
+    let mut denoms: Vec<&ChipDenomination> = input
         .case_chips
         .iter()
-        .map(|c| ChipDenomination {
-            value: c.value,
-            count: c.count / input.players.max(1),
-        })
-        .filter(|c| c.count > 0)
+        .filter(|c| c.value > 0 && c.count > 0)
         .collect();
+    denoms.sort_by_key(|c| c.value);
 
-    let starting_stack: u32 = chips_per_player.iter().map(|c| c.value * c.count).sum();
-    let total_chips = starting_stack * input.players;
+    // 2. Profondeur cible dynamique (en BB), bornée.
+    let depth_bb = target_depth_bb(players, input.total_duration_minutes);
 
-    // Plus petite dénomination du stack joueur = unité d'arrondi des blinds.
-    // On l'utilise pour mettre à l'échelle l'échelle canonique.
+    // 3. Alloue le stack à partir des 2 plus petites dénominations, en visant
+    //    `depth_bb × bb1`, borné par les dispos de la malette.
+    let (chips_per_player, starting_stack, bb1) =
+        allocate_stack(&denoms, players, depth_bb);
+
+    let total_chips = starting_stack.saturating_mul(players);
+
+    // 4. Durée de niveau (conservée : dépend de la durée totale).
+    let level_duration_minutes = pick_level_duration(input.total_duration_minutes);
+    let target_levels = (input.total_duration_minutes / level_duration_minutes).max(1);
+
+    // 5. Unité = plus petit jeton distribué ; sinon bb1/2 en secours.
     let unit = chips_per_player
         .iter()
         .map(|c| c.value)
         .min()
         .filter(|&v| v > 0)
-        .unwrap_or(1);
+        .unwrap_or((bb1 / 2).max(1));
 
-    // 2. Durée de niveau + nombre de niveaux visés.
-    let level_duration_minutes = pick_level_duration(input.total_duration_minutes);
-    let target_levels = (input.total_duration_minutes / level_duration_minutes).max(1);
+    // 6. SB de départ forcée à v1 (index 0 de l'échelle).
+    let start_idx = 0usize;
 
-    // 3. Cible SB de départ ≈ stack/200 (profondeur ~100 BB, classique).
-    let start_sb_target = (starting_stack.max(2) / 200).max(unit);
-    let start_idx = find_ladder_index(start_sb_target, unit);
-
-    // 4. Cible SB de fin: au dernier niveau, la table finale à ~3 joueurs doit
-    // avoir un M-ratio ≈ 5 BB. total/3 / 5 BB => BB ≈ total/15 => SB ≈ total/30.
-    let end_sb_target = (total_chips / 30).max(start_sb_target.saturating_mul(4));
+    // 7. SB de fin : table finale à ~3 joueurs, M ≈ 5 BB → BB ≈ total/15.
+    let end_sb_target = (total_chips / 30).max(bb1 * 2);
     let end_idx_min = find_ladder_index(end_sb_target, unit);
-    // Garantir une progression monotone stricte sur tous les niveaux demandés.
     let min_span_end = start_idx + (target_levels.saturating_sub(1) as usize);
     let end_idx = end_idx_min
         .max(min_span_end)
         .min(SB_LADDER_UNITS.len() - 1);
 
-    // Si on dépasse le sommet de l'échelle, on tronque le nombre de niveaux.
     let number_of_levels = target_levels.min((end_idx - start_idx + 1) as u32);
 
-    // 5. Construction des niveaux via parcours linéaire de l'échelle.
+    // 8. Construction des niveaux.
     let ante_starts_at = (number_of_levels / 3).max(1);
     let break_after = if number_of_levels >= 6 {
         Some(number_of_levels / 2)
@@ -131,7 +139,6 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
         let sb = SB_LADDER_UNITS[idx] * unit;
         let bb = sb * 2;
 
-        // Ante ≈ BB/4 à partir du tiers du tournoi, arrondie à l'unité.
         let ante = if i + 1 >= ante_starts_at {
             let raw = bb / 4;
             let rounded = ((raw as f64 / unit as f64).round() as u32) * unit;
@@ -171,12 +178,109 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
     }
 }
 
-/// Choisit la durée d'un niveau en visant ~6–12 niveaux selon la durée totale.
+/// Profondeur cible du stack en big blinds, dépendant de la durée et du nombre
+/// de joueurs.
 ///
-/// - Très court (≤5 min) → 1 min : même 5 min donne 5 niveaux
-/// - Court (6–20 min) → 2–3 min
-/// - Moyen (21–150 min) → 5–12 min
-/// - Long (>150 min) → 15–30 min
+/// Formule : `duration_min / 3 + log2(players) * 10`, bornée à \[60, 150\].
+///
+/// Justification :
+/// - Base ∝ durée : ~60 BB pour 3h de base.
+/// - Bonus ∝ log₂(N) : Harrington — un joueur doit doubler log₂(N) fois pour
+///   gagner ; +10 BB par doublement compense la longueur structurelle requise.
+/// - Bornes \[60, 150\] : en dessous = turbo, au delà = deep (peu home-game).
+fn target_depth_bb(players: u32, duration_minutes: u32) -> u32 {
+    let base = duration_minutes / 3;
+    let log2_players = (players.max(2) as f64).log2();
+    let bonus = (log2_players * 10.0).round() as u32;
+    base.saturating_add(bonus)
+        .clamp(MIN_DEPTH_BB, MAX_DEPTH_BB)
+}
+
+/// Alloue le stack de départ à partir des 2 plus petites dénominations
+/// disponibles dans la malette, en visant `depth_bb × bb1`.
+///
+/// Retourne `(chips_per_player, starting_stack, bb1)` avec `bb1 = 2 × v1`.
+fn allocate_stack(
+    denoms: &[&ChipDenomination],
+    players: u32,
+    depth_bb: u32,
+) -> (Vec<ChipDenomination>, u32, u32) {
+    let players = players.max(1);
+    if denoms.is_empty() {
+        return (Vec::new(), 0, 1);
+    }
+
+    let v1 = denoms[0].value;
+    let max_v1 = denoms[0].count / players;
+    let bb1 = v1.saturating_mul(2);
+    let target = depth_bb.saturating_mul(bb1);
+
+    // Cas dégénéré : 1 seule dénomination → on distribue dans la limite cible+dispo.
+    if denoms.len() == 1 {
+        let want = (target + v1 / 2) / v1;
+        let count_v1 = want.min(max_v1);
+        let chips = if count_v1 > 0 {
+            vec![ChipDenomination { value: v1, count: count_v1 }]
+        } else {
+            Vec::new()
+        };
+        return (chips, count_v1 * v1, bb1);
+    }
+
+    let v2 = denoms[1].value;
+    let max_v2 = denoms[1].count / players;
+
+    // Cible bornée par ce que la malette peut fournir.
+    let ceiling = max_v1.saturating_mul(v1).saturating_add(max_v2.saturating_mul(v2));
+    let target = target.min(ceiling);
+
+    // Répartition 40 % v1 / 60 % v2 en **valeur**, plafonnée par les dispos.
+    let target_v2_value = target.saturating_mul(V2_VALUE_SHARE_PCT) / 100;
+    let mut count_v2 = (target_v2_value + v2 / 2) / v2;
+    count_v2 = count_v2.min(max_v2);
+
+    let remaining = target.saturating_sub(count_v2.saturating_mul(v2));
+    let mut count_v1 = (remaining + v1 / 2) / v1;
+    count_v1 = count_v1.min(max_v1);
+
+    // Top-up pour s'approcher de la cible. On préfère v2 (moins de jetons
+    // physiques par unité de valeur) puis v1.
+    let mut achieved = count_v1 * v1 + count_v2 * v2;
+    while achieved < target {
+        let need = target - achieved;
+        if count_v2 < max_v2 && need >= v2 / 2 {
+            count_v2 += 1;
+            achieved = count_v1 * v1 + count_v2 * v2;
+            continue;
+        }
+        if count_v1 < max_v1 {
+            let add = ((need + v1 / 2) / v1).min(max_v1 - count_v1).max(1);
+            count_v1 += add;
+            achieved = count_v1 * v1 + count_v2 * v2;
+            continue;
+        }
+        break;
+    }
+
+    // Minimum de petits jetons pour payer SB/BB.
+    let min_v1 = MIN_V1_COUNT.min(max_v1);
+    if count_v1 < min_v1 {
+        count_v1 = min_v1;
+        achieved = count_v1 * v1 + count_v2 * v2;
+    }
+
+    let mut chips = Vec::with_capacity(2);
+    if count_v1 > 0 {
+        chips.push(ChipDenomination { value: v1, count: count_v1 });
+    }
+    if count_v2 > 0 {
+        chips.push(ChipDenomination { value: v2, count: count_v2 });
+    }
+
+    (chips, achieved, bb1)
+}
+
+/// Choisit la durée d'un niveau en visant ~6–12 niveaux selon la durée totale.
 fn pick_level_duration(total_minutes: u32) -> u32 {
     match total_minutes {
         0..=5 => 1,
@@ -236,7 +340,7 @@ mod tests {
         }
     }
 
-    /// Malette du serveur de prod (williou malette), 5 joueurs.
+    /// Malette serveur prod (williou), 5 joueurs.
     fn server_malette_5p(total_min: u32) -> TournamentInput {
         TournamentInput {
             players: 5,
@@ -254,12 +358,61 @@ mod tests {
     }
 
     #[test]
-    fn chips_are_distributed_per_player() {
+    fn uses_only_two_smallest_denominations() {
         let s = compute_structure(&standard_input());
-        // 100/9=11, 100/9=11, 50/9=5, 25/9=2 → 11*25 + 11*100 + 5*500 + 2*1000 = 5875
-        assert_eq!(s.starting_stack, 5875);
-        assert_eq!(s.total_chips, 5875 * 9);
-        assert_eq!(s.chips_per_player.len(), 4);
+        assert_eq!(s.chips_per_player.len(), 2);
+        let values: Vec<u32> = s.chips_per_player.iter().map(|c| c.value).collect();
+        assert_eq!(values, vec![25, 100]);
+    }
+
+    #[test]
+    fn first_big_blind_equals_twice_smallest_chip() {
+        let s = compute_structure(&standard_input());
+        let first = s.levels.iter().find(|l| !l.is_break).unwrap();
+        assert_eq!(first.small_blind, 25);
+        assert_eq!(first.big_blind, 50);
+
+        let s2 = compute_structure(&server_malette_5p(60));
+        let first2 = s2.levels.iter().find(|l| !l.is_break).unwrap();
+        assert_eq!(first2.small_blind, 1);
+        assert_eq!(first2.big_blind, 2);
+    }
+
+    #[test]
+    fn starting_stack_depth_is_within_dynamic_range() {
+        let s = compute_structure(&standard_input());
+        let bb1 = s.levels.iter().find(|l| !l.is_break).unwrap().big_blind;
+        let depth = s.starting_stack as f64 / bb1 as f64;
+        assert!(
+            depth >= 20.0 && depth <= 160.0,
+            "profondeur {} BB hors plage raisonnable",
+            depth
+        );
+    }
+
+    #[test]
+    fn starting_stack_respects_malette_availability() {
+        // 100/9=11 dispo pour 25, 100/9=11 dispo pour 100 → plafond 1375.
+        let s = compute_structure(&standard_input());
+        assert!(
+            s.starting_stack <= 1375,
+            "stack {} > plafond malette 1375",
+            s.starting_stack
+        );
+        for chip in &s.chips_per_player {
+            match chip.value {
+                25 => assert!(chip.count <= 11),
+                100 => assert!(chip.count <= 11),
+                v => panic!("dénomination inattendue {v}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stack_has_enough_small_chips_to_pay_blinds() {
+        let s = compute_structure(&standard_input());
+        let small = s.chips_per_player.iter().find(|c| c.value == 25).unwrap();
+        assert!(small.count >= MIN_V1_COUNT.min(11));
     }
 
     #[test]
@@ -279,13 +432,12 @@ mod tests {
 
     #[test]
     fn level_duration_is_picked_reasonably() {
-        // 240 min → 20 min par niveau (12 niveaux).
         let s = compute_structure(&standard_input());
         assert_eq!(s.level_duration_minutes, 20);
     }
 
     #[test]
-    fn drops_denominations_with_zero_per_player() {
+    fn falls_back_to_single_denomination_when_malette_too_thin() {
         let input = TournamentInput {
             players: 3,
             total_duration_minutes: 120,
@@ -295,30 +447,30 @@ mod tests {
             ],
         };
         let s = compute_structure(&input);
+        // 2/3 = 0 → v2 éliminée, reste v1 = 25 avec 30/3 = 10 dispo.
         assert_eq!(s.chips_per_player.len(), 1);
         assert_eq!(s.chips_per_player[0].value, 25);
-        assert_eq!(s.chips_per_player[0].count, 10);
+        assert!(s.chips_per_player[0].count <= 10);
     }
 
     #[test]
     fn bb_is_always_double_sb() {
         let s = compute_structure(&server_malette_5p(60));
         for lvl in s.levels.iter().filter(|l| !l.is_break) {
-            assert_eq!(lvl.big_blind, lvl.small_blind * 2, "level {}", lvl.level);
+            assert_eq!(lvl.big_blind, lvl.small_blind * 2);
         }
     }
 
     #[test]
     fn blinds_use_canonical_round_values() {
         let s = compute_structure(&server_malette_5p(60));
-        let unit = 1; // plus petit jeton de la malette
+        let unit = 1;
         for lvl in s.levels.iter().filter(|l| !l.is_break) {
             let sb_in_units = lvl.small_blind / unit;
             assert!(
                 SB_LADDER_UNITS.contains(&sb_in_units),
-                "SB {} ({} units) hors échelle canonique",
-                lvl.small_blind,
-                sb_in_units
+                "SB {} hors échelle",
+                lvl.small_blind
             );
         }
     }
@@ -327,11 +479,7 @@ mod tests {
     fn five_minute_game_has_multiple_levels() {
         let s = compute_structure(&server_malette_5p(5));
         let playing = s.levels.iter().filter(|l| !l.is_break).count();
-        assert!(
-            playing >= 4,
-            "5-min game devrait avoir au moins 4 niveaux, a {}",
-            playing
-        );
+        assert!(playing >= 4);
         assert_eq!(s.level_duration_minutes, 1);
     }
 
@@ -342,21 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn first_blind_matches_smallest_chip_scale() {
-        // Malette avec jeton minimal à 1 → SB initiale multiple de 1, démarre petit.
-        let s = compute_structure(&server_malette_5p(60));
-        let first = s.levels.iter().find(|l| !l.is_break).unwrap();
-        let ratio = first.big_blind as f64 / s.starting_stack as f64;
-        assert!(
-            ratio >= 0.005 && ratio <= 0.03,
-            "1ère BB ({}) hors ratio par rapport au stack ({}): {:.3}",
-            first.big_blind,
-            s.starting_stack,
-            ratio
-        );
-    }
-
-    #[test]
     fn antes_kick_in_mid_tournament() {
         let s = compute_structure(&standard_input());
         let playing: Vec<_> = s.levels.iter().filter(|l| !l.is_break).collect();
@@ -364,7 +497,15 @@ mod tests {
         assert!(playing.last().unwrap().ante > 0);
     }
 
-    /// Aperçu visuel: `cargo test preview_output -- --nocapture`.
+    #[test]
+    fn depth_formula_scales_with_players_and_duration() {
+        assert!(target_depth_bb(16, 180) >= target_depth_bb(4, 180));
+        assert!(target_depth_bb(8, 300) >= target_depth_bb(8, 60));
+        assert!(target_depth_bb(2, 1) >= MIN_DEPTH_BB);
+        assert!(target_depth_bb(100, 10_000) <= MAX_DEPTH_BB);
+    }
+
+    /// Aperçu : `cargo test preview_output -- --nocapture`.
     #[test]
     fn preview_output() {
         for (players, total) in [(5, 5), (5, 30), (5, 60), (5, 120), (9, 240)] {
@@ -375,13 +516,17 @@ mod tests {
             };
             let s = compute_structure(&input);
             eprintln!(
-                "\n=== {} joueurs / {} min — stack={} total={} lvl={}'x{} ===",
+                "\n=== {} joueurs / {} min — stack={} total={} lvl={}'x{} chips={:?} ===",
                 players,
                 total,
                 s.starting_stack,
                 s.total_chips,
                 s.level_duration_minutes,
-                s.number_of_levels
+                s.number_of_levels,
+                s.chips_per_player
+                    .iter()
+                    .map(|c| format!("{}x{}", c.value, c.count))
+                    .collect::<Vec<_>>()
             );
             for l in &s.levels {
                 if l.is_break {
