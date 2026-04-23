@@ -46,7 +46,10 @@ pub struct TournamentStructure {
     pub starting_stack: u32,
     /// Valeur totale en jeu (starting_stack * players).
     pub total_chips: u32,
-    /// Durée de niveau choisie automatiquement, en minutes.
+    /// Durée de **base** (= premier niveau, phase constante), en minutes. Les
+    /// paliers suivants chutent par marches : ~75 %, ~50 %, ~25 % de cette base
+    /// vers la fin du tournoi (accélération par tiers). Pour la durée réelle
+    /// d'un niveau donné, lire `levels[i].duration_minutes`.
     pub level_duration_minutes: u32,
     pub number_of_levels: u32,
     pub levels: Vec<BlindLevel>,
@@ -77,6 +80,28 @@ const MAX_DENOMS_IN_STACK: usize = 4;
 /// Nombre minimal de jetons v1 gardés par joueur (pour payer SB/BB bas).
 const MIN_V1_COUNT: u32 = 4;
 
+/// Schéma d'accélération à **4 paliers** : la durée reste constante au début,
+/// puis chute par marches discrètes vers la fin :
+/// - Tier 1 : 100 % de `base` (phase constante au début).
+/// - Tier 2 :  75 % de `base`.
+/// - Tier 3 :  50 % de `base`.
+/// - Tier 4 :  25 % de `base` (fin de tournoi, push/fold).
+///
+/// Proportions idéales du nombre de paliers par tier : 4:3:3:2
+/// (ex. base=20, total=165 min → 4×20 + 3×15 + 3×10 + 2×5 = 165 ✓).
+const TIER_FACTORS: [f64; 4] = [1.0, 0.75, 0.50, 0.25];
+const TIER_WEIGHTS: [u32; 4] = [4, 3, 3, 2];
+
+/// Durée **minimale** d'un palier, en minutes. Un niveau plus court serait
+/// frustrant (les joueurs n'ont pas le temps de jouer une vraie main). Tous
+/// les tiers sont clampés à ce plancher.
+const MIN_LEVEL_MINUTES: u32 = 3;
+
+/// Durée **maximale** d'un palier, en minutes. Au-delà, un niveau s'éternise
+/// ; les tournois plus longs gagnent plutôt en nombre de paliers qu'en durée
+/// de palier.
+const MAX_LEVEL_MINUTES: u32 = 15;
+
 pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
     let players = input.players.max(1);
 
@@ -98,9 +123,15 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
 
     let total_chips = starting_stack.saturating_mul(players);
 
-    // 4. Durée de niveau (conservée : dépend de la durée totale).
+    // 4. Durée "de base" (= premier niveau) déduite de la durée totale.
     let level_duration_minutes = pick_level_duration(input.total_duration_minutes);
-    let target_levels = (input.total_duration_minutes / level_duration_minutes).max(1);
+
+    // 4b. Durées par niveau avec **accélération en fin** : premiers niveaux
+    // à la durée de base, derniers niveaux à ~LATE_LEVEL_FACTOR × base. La
+    // somme colle à `total_duration_minutes`. Plus de niveaux globalement
+    // (moyenne < base) → plus de paliers vers la fin.
+    let mut level_durations =
+        compute_level_durations(input.total_duration_minutes, level_duration_minutes);
 
     // 5. Unité = plus petit jeton distribué ; sinon bb1/2 en secours.
     let unit = chips_per_player
@@ -116,21 +147,28 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
     // 7. SB de fin : table finale à ~3 joueurs, M ≈ 5 BB → BB ≈ total/15.
     let end_sb_target = (total_chips / 30).max(bb1 * 2);
     let end_idx_min = find_ladder_index(end_sb_target, unit);
-    let min_span_end = start_idx + (target_levels.saturating_sub(1) as usize);
+    let min_span_end = start_idx + level_durations.len().saturating_sub(1);
     let end_idx = end_idx_min
         .max(min_span_end)
         .min(SB_LADDER_UNITS.len() - 1);
 
-    let number_of_levels = target_levels.min((end_idx - start_idx + 1) as u32);
+    // Si l'échelle canonique limite le nombre de paliers, tronquer les
+    // durées (la fin de partie absorbe la compression).
+    let max_levels = (end_idx - start_idx + 1) as u32;
+    if (level_durations.len() as u32) > max_levels {
+        level_durations.truncate(max_levels as usize);
+    }
+    let number_of_levels = level_durations.len() as u32;
 
     // 8. Construction des niveaux.
     let ante_starts_at = (number_of_levels / 3).max(1);
-    let break_after = if number_of_levels >= 6 {
+    let break_minutes = break_duration(input.total_duration_minutes);
+    // Pause insérée uniquement si elle a une durée > 0 (tournois courts = 0).
+    let break_after = if number_of_levels >= 6 && break_minutes > 0 {
         Some(number_of_levels / 2)
     } else {
         None
     };
-    let break_minutes = break_duration(input.total_duration_minutes);
 
     let mut levels = Vec::with_capacity(number_of_levels as usize + 1);
     for i in 0..number_of_levels {
@@ -158,7 +196,7 @@ pub fn compute_structure(input: &TournamentInput) -> TournamentStructure {
             small_blind: sb,
             big_blind: bb,
             ante,
-            duration_minutes: level_duration_minutes,
+            duration_minutes: level_durations[i as usize],
             is_break: false,
         });
 
@@ -457,19 +495,147 @@ fn greedy_fallback(
     (chips, achieved, bb1)
 }
 
-/// Choisit la durée d'un niveau en visant ~6–12 niveaux selon la durée totale.
+/// Construit la liste des durées de niveau en minutes, en phase **constante
+/// puis accélération par marches** :
+/// - Les premiers niveaux durent `base` minutes (plateau).
+/// - Puis des marches vers `0.75 × base`, `0.50 × base`, `0.25 × base`.
+/// - Proportions idéales du nombre de paliers : 4:3:3:2 (cf. [`TIER_WEIGHTS`]).
+/// - La somme des durées vaut **exactement** `total_minutes` : on cherche la
+///   combinaison entière `(n1, n2, n3, n4)` qui respecte `Σ n_i × d_i = total`
+///   et dont la répartition du **temps par tier** se rapproche le plus des
+///   ratios cibles (erreur quadratique minimale).
+/// - Les niveaux sont émis par tier décroissant : durées non croissantes.
+fn compute_level_durations(total_minutes: u32, base: u32) -> Vec<u32> {
+    let base = base.max(1);
+    let total = total_minutes.max(1);
+
+    // Calcul des durées par tier, clampées à [MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES].
+    let tier_d: [u32; 4] = [
+        ((base as f64 * TIER_FACTORS[0]).round() as u32)
+            .clamp(MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES),
+        ((base as f64 * TIER_FACTORS[1]).round() as u32)
+            .clamp(MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES),
+        ((base as f64 * TIER_FACTORS[2]).round() as u32)
+            .clamp(MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES),
+        ((base as f64 * TIER_FACTORS[3]).round() as u32)
+            .clamp(MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES),
+    ];
+
+    // Cas dégénéré (base ≤ MIN) : tous les tiers collapsent à MIN ⇒ paliers
+    // uniformes. On étend le *premier* palier avec le résidu pour garder des
+    // durées non croissantes.
+    if tier_d[0] == tier_d[3] {
+        let d = tier_d[0];
+        if total < d {
+            // Tournoi plus court qu'un palier minimum : un seul palier =
+            // `total` (on enfreint MIN, mais on ne peut pas faire mieux).
+            return vec![total.max(1)];
+        }
+        let n = (total / d).max(1);
+        let mut out = vec![d; n as usize];
+        let leftover = total - n * d;
+        if leftover > 0 {
+            if let Some(first) = out.first_mut() {
+                *first += leftover;
+            }
+        }
+        return out;
+    }
+
+    // Temps par tier pour un bloc de référence 4:3:3:2 → unit_time.
+    let unit_time: u32 = (0..4).map(|i| TIER_WEIGHTS[i] * tier_d[i]).sum();
+    let unit_time = unit_time.max(1);
+    let target_ratios: [f64; 4] = [
+        (TIER_WEIGHTS[0] * tier_d[0]) as f64 / unit_time as f64,
+        (TIER_WEIGHTS[1] * tier_d[1]) as f64 / unit_time as f64,
+        (TIER_WEIGHTS[2] * tier_d[2]) as f64 / unit_time as f64,
+        (TIER_WEIGHTS[3] * tier_d[3]) as f64 / unit_time as f64,
+    ];
+
+    // Énumération des `(n1, n2, n3, n4)` satisfaisant exactement le budget.
+    // n4 est déduit du résidu (s'il est divisible par d4).
+    let max_n1 = total / tier_d[0];
+    let max_n2 = total / tier_d[1];
+    let max_n3 = total / tier_d[2];
+    let mut best: Option<([u32; 4], f64)> = None;
+
+    for n1 in 0..=max_n1 {
+        let t1 = n1 * tier_d[0];
+        if t1 > total {
+            break;
+        }
+        for n2 in 0..=max_n2 {
+            let t12 = t1 + n2 * tier_d[1];
+            if t12 > total {
+                break;
+            }
+            for n3 in 0..=max_n3 {
+                let t123 = t12 + n3 * tier_d[2];
+                if t123 > total {
+                    break;
+                }
+                let remaining = total - t123;
+                if remaining % tier_d[3] != 0 {
+                    continue;
+                }
+                let n4 = remaining / tier_d[3];
+                let total_n = n1 + n2 + n3 + n4;
+                if total_n == 0 {
+                    continue;
+                }
+
+                // Erreur = écart aux ratios de temps cibles.
+                let actual = [
+                    (n1 * tier_d[0]) as f64 / total as f64,
+                    (n2 * tier_d[1]) as f64 / total as f64,
+                    (n3 * tier_d[2]) as f64 / total as f64,
+                    (n4 * tier_d[3]) as f64 / total as f64,
+                ];
+                let mut err = 0.0f64;
+                for i in 0..4 {
+                    err += (actual[i] - target_ratios[i]).powi(2);
+                }
+
+                match &best {
+                    None => best = Some(([n1, n2, n3, n4], err)),
+                    Some((_, e)) if err < *e => best = Some(([n1, n2, n3, n4], err)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let counts = best.map(|(c, _)| c).unwrap_or([1, 0, 0, 0]);
+
+    // Assemble les durées : tiers décroissants ⇒ durées non croissantes.
+    let mut out: Vec<u32> = Vec::with_capacity(counts.iter().sum::<u32>() as usize);
+    for (i, &c) in counts.iter().enumerate() {
+        for _ in 0..c {
+            out.push(tier_d[i]);
+        }
+    }
+
+    // Filet de sécurité : jamais vide.
+    if out.is_empty() {
+        out.push(total.max(1));
+    }
+
+    out
+}
+
+/// Choisit la durée "de base" d'un niveau selon la durée totale. Toujours
+/// clampée à \[[`MIN_LEVEL_MINUTES`], [`MAX_LEVEL_MINUTES`]\] : pas de paliers
+/// de moins de 3 min ni de plus de 15 min.
 fn pick_level_duration(total_minutes: u32) -> u32 {
-    match total_minutes {
-        0..=5 => 1,
-        6..=10 => 2,
-        11..=20 => 3,
+    let raw = match total_minutes {
+        0..=10 => 3,
+        11..=20 => 4,
         21..=40 => 5,
         41..=80 => 8,
         81..=150 => 12,
-        151..=300 => 20,
-        301..=480 => 25,
-        _ => 30,
-    }
+        _ => 15,
+    };
+    raw.clamp(MIN_LEVEL_MINUTES, MAX_LEVEL_MINUTES)
 }
 
 /// Durée de pause en fonction de la durée totale du tournoi.
@@ -648,7 +814,11 @@ mod tests {
     #[test]
     fn level_duration_is_picked_reasonably() {
         let s = compute_structure(&standard_input());
-        assert_eq!(s.level_duration_minutes, 20);
+        // 240 min → base = 15 (plafond max), la durée réelle du premier
+        // palier peut excéder légèrement cause ajustements.
+        assert!(s.level_duration_minutes >= MIN_LEVEL_MINUTES);
+        assert!(s.level_duration_minutes <= MAX_LEVEL_MINUTES);
+        assert_eq!(s.level_duration_minutes, 15);
     }
 
     #[test]
@@ -691,11 +861,39 @@ mod tests {
     }
 
     #[test]
-    fn five_minute_game_has_multiple_levels() {
+    fn very_short_game_has_at_least_one_level() {
+        // 5 min total + MIN_LEVEL_MINUTES=3 ⇒ au plus 1 palier (on absorbe
+        // le résidu dans le premier).
         let s = compute_structure(&server_malette_5p(5));
-        let playing = s.levels.iter().filter(|l| !l.is_break).count();
-        assert!(playing >= 4);
-        assert_eq!(s.level_duration_minutes, 1);
+        let playing: Vec<_> = s.levels.iter().filter(|l| !l.is_break).collect();
+        assert!(!playing.is_empty());
+        assert_eq!(s.level_duration_minutes, MIN_LEVEL_MINUTES);
+    }
+
+    #[test]
+    fn every_level_respects_min_max_duration() {
+        for total in [30u32, 60, 120, 240, 480, 720] {
+            for players in [2u32, 5, 9] {
+                let input = TournamentInput {
+                    players,
+                    total_duration_minutes: total,
+                    case_chips: server_malette_chips(),
+                };
+                let s = compute_structure(&input);
+                for lvl in s.levels.iter().filter(|l| !l.is_break) {
+                    assert!(
+                        lvl.duration_minutes >= MIN_LEVEL_MINUTES,
+                        "total={} players={} level {} = {} min < MIN",
+                        total, players, lvl.level, lvl.duration_minutes
+                    );
+                    assert!(
+                        lvl.duration_minutes <= MAX_LEVEL_MINUTES,
+                        "total={} players={} level {} = {} min > MAX",
+                        total, players, lvl.level, lvl.duration_minutes
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -774,6 +972,72 @@ mod tests {
             smallest.count,
             largest.value,
             largest.count
+        );
+    }
+
+    #[test]
+    fn level_durations_accelerate_toward_end() {
+        // Sur un tournoi long, les premiers niveaux doivent être plus longs
+        // que les derniers (accélération en fin de partie).
+        let s = compute_structure(&standard_input());
+        let playing: Vec<_> = s.levels.iter().filter(|l| !l.is_break).collect();
+        assert!(playing.len() >= 6, "test requires multiple levels");
+        let first = playing.first().unwrap().duration_minutes;
+        let last = playing.last().unwrap().duration_minutes;
+        assert!(
+            last < first,
+            "dernier niveau ({} min) doit être plus court que le premier ({} min)",
+            last,
+            first
+        );
+        // Durées non croissantes.
+        for pair in playing.windows(2) {
+            assert!(
+                pair[1].duration_minutes <= pair[0].duration_minutes,
+                "durées doivent être non croissantes : {} puis {}",
+                pair[0].duration_minutes,
+                pair[1].duration_minutes
+            );
+        }
+    }
+
+    #[test]
+    fn level_durations_sum_to_requested_total() {
+        // La somme des durées de jeu (hors pause) doit valoir exactement
+        // `total_duration_minutes`.
+        for total in [30u32, 60, 120, 240, 480] {
+            let input = TournamentInput {
+                players: 6,
+                total_duration_minutes: total,
+                case_chips: server_malette_chips(),
+            };
+            let s = compute_structure(&input);
+            let play_sum: u32 = s
+                .levels
+                .iter()
+                .filter(|l| !l.is_break)
+                .map(|l| l.duration_minutes)
+                .sum();
+            assert_eq!(
+                play_sum, total,
+                "somme des durées de jeu = {} ≠ total = {}",
+                play_sum, total
+            );
+        }
+    }
+
+    #[test]
+    fn more_levels_than_linear_uniform_structure() {
+        // Accélération ⇒ plus de niveaux que total/base (ex. 240/15 = 16 → on
+        // doit avoir strictement plus grâce aux tiers 75/50/25 %).
+        let s = compute_structure(&standard_input());
+        let playing = s.levels.iter().filter(|l| !l.is_break).count() as u32;
+        let uniform = 240 / s.level_duration_minutes;
+        assert!(
+            playing > uniform,
+            "attendu > {} niveaux avec taper, obtenu {}",
+            uniform,
+            playing
         );
     }
 
